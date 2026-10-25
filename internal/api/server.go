@@ -68,6 +68,28 @@ func (s *Server) Routes() http.Handler {
 		r.With(books).Post("/invoices/{id}/cancel", s.handleCancelInvoice)
 		r.With(books).Get("/invoices/{id}/journal", s.handleInvoiceJournal)
 
+		r.With(books).Post("/invoices/{id}/correct", s.handleCorrectInvoice)
+
+		r.With(staff).Post("/products", s.handleCreateProduct)
+		r.With(staff).Get("/products", s.handleListProducts)
+		r.With(staff).Get("/products/{id}", s.handleGetProduct)
+		r.With(staff).Get("/stock-movements", s.handleStockMovements)
+		r.With(staff).Get("/reports/stock", s.handleStockReport)
+
+		r.With(staff).Post("/payments", s.handleCreatePayment)
+		r.With(staff).Get("/payments", s.handleListPayments)
+		r.With(staff).Get("/payments/{id}", s.handleGetPayment)
+		r.With(books).Delete("/payments/{id}", s.handleDeletePayment)
+		r.With(books).Post("/payments/{id}/apply-advance", s.handleApplyAdvance)
+
+		r.With(books).Get("/reports/aging", s.handleAging)
+		r.With(books).Get("/reports/vat-summary", s.handleVATSummary)
+		r.With(books).Get("/contacts/{id}/statement", s.handleContactStatement)
+		r.With(httpx.RequireRole(auth.RoleCustomer)).Get("/me/statement", s.handleMyStatement)
+
+		r.With(httpx.RequireRole(auth.RoleOwner)).Get("/settings", s.handleGetSettings)
+		r.With(httpx.RequireRole(auth.RoleOwner)).Put("/settings", s.handleUpdateSettings)
+
 		r.With(books).Get("/periods", s.handleGetPeriods)
 		r.With(books).Post("/periods/close", s.handleClosePeriod)
 		r.With(books).Get("/reports/trial-balance", s.handleTrialBalance)

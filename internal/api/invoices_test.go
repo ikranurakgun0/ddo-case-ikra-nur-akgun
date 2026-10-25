@@ -132,8 +132,12 @@ func TestPurchaseInvoiceJournalAndSeries(t *testing.T) {
 	if inv["series"] != "AL" || inv["number"] != "AL-2026-000001" {
 		t.Fatalf("alış serisi: %v", inv)
 	}
-	if d, _ := balanceOf(t, e, tok, "153"); d != 20000 {
-		t.Errorf("153 borç: %v", d)
+	// Ürün bağlı olmayan alış satırı stok değil gider hesabına yazılır (153 yalnızca stoğu temsil eder)
+	if d, _ := balanceOf(t, e, tok, "770"); d != 20000 {
+		t.Errorf("770 borç: %v", d)
+	}
+	if d, _ := balanceOf(t, e, tok, "153"); d != 0 {
+		t.Errorf("153 borç 0 olmalı: %v", d)
 	}
 	if d, _ := balanceOf(t, e, tok, "191"); d != 4000 {
 		t.Errorf("191 borç: %v", d)

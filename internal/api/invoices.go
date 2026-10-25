@@ -2,7 +2,7 @@ package api
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,9 +14,12 @@ import (
 	"esnafdefter/internal/httpx"
 	"esnafdefter/internal/invoicing"
 	"esnafdefter/internal/ledger"
+	"esnafdefter/internal/payments"
+	"esnafdefter/internal/stock"
 )
 
 type invoiceLineReq struct {
+	ProductID   string      `json:"product_id"` // isteğe bağlı; stok takipli ürünse stok hareketi üretir
 	Description string      `json:"description"`
 	Quantity    json.Number `json:"quantity"`   // ondalık, en fazla 3 basamak (ör. 2.5)
 	UnitPrice   int64       `json:"unit_price"` // kuruş
@@ -33,6 +36,7 @@ type invoiceReq struct {
 	PricesIncludeVAT bool             `json:"prices_include_vat"`
 	GeneralDiscount  int64            `json:"general_discount"` // kuruş
 	Lines            []invoiceLineReq `json:"lines"`
+	CancelDate       string           `json:"cancel_date"` // yalnızca /correct için: eski faturanın ters kayıt tarihi
 }
 
 func parseDate(s string) (time.Time, bool) {
@@ -52,120 +56,107 @@ func (s *Server) handleCreateInvoice(w http.ResponseWriter, r *http.Request) {
 	if !httpx.DecodeBytes(w, body, &req) {
 		return
 	}
+	params, ok := s.invoiceParams(w, c.BusinessID, c.UserID, req)
+	if !ok {
+		return
+	}
+	s.runIdempotent(w, r, body, c.BusinessID, func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return invoicing.CreateAndFinalize(ctx, tx, params)
+	})
+}
+
+// invoiceParams istek gövdesini doğrulayıp servis parametrelerine çevirir.
+func (s *Server) invoiceParams(w http.ResponseWriter, businessID, userID string, req invoiceReq) (invoicing.CreateParams, bool) {
 	if !isUUID(req.ContactID) {
 		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "contact_id geçersiz")
-		return
+		return invoicing.CreateParams{}, false
 	}
 	issue, ok1 := parseDate(req.IssueDate)
 	due, ok2 := parseDate(req.DueDate)
 	if !ok1 || !ok2 {
 		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "tarihler YYYY-AA-GG biçiminde olmalı")
-		return
+		return invoicing.CreateParams{}, false
 	}
 	lines := make([]invoicing.LineInput, 0, len(req.Lines))
 	for _, l := range req.Lines {
 		q, err := invoicing.ParseQuantityMilli(l.Quantity.String())
 		if err != nil {
-			s.writeInvoiceError(w, err)
-			return
+			s.writeDomainError(w, err)
+			return invoicing.CreateParams{}, false
 		}
-		lines = append(lines, invoicing.LineInput{Description: l.Description, QuantityMilli: q,
+		lines = append(lines, invoicing.LineInput{ProductID: l.ProductID, Description: l.Description, QuantityMilli: q,
 			UnitPrice: l.UnitPrice, VATRate: l.VATRate, Discount: l.Discount})
 	}
-
-	key := r.Header.Get("Idempotency-Key")
-	if len(key) > 200 {
-		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "Idempotency-Key en fazla 200 karakter")
-		return
-	}
-
-	tx, err := s.pool.Begin(r.Context())
-	if err != nil {
-		s.internalError(w, "transaction", err)
-		return
-	}
-	defer tx.Rollback(r.Context()) //nolint:errcheck
-
-	var hash [32]byte
-	if key != "" {
-		hash = sha256.Sum256(append([]byte(r.Method+" "+r.URL.Path+"\n"), body...))
-		// Aynı anahtarla eşzamanlı iki istek: ikincisi, birincinin commit'ini bekler (birincil anahtar çakışması).
-		tag, err := tx.Exec(r.Context(),
-			`INSERT INTO idempotency_keys(business_id, key, request_hash) VALUES ($1::uuid, $2, $3)
-			 ON CONFLICT (business_id, key) DO NOTHING`, c.BusinessID, key, hash[:])
-		if err != nil {
-			s.internalError(w, "idempotans", err)
-			return
-		}
-		if tag.RowsAffected() == 0 {
-			var storedHash []byte
-			var status *int
-			var resp []byte
-			err := tx.QueryRow(r.Context(),
-				`SELECT request_hash, status_code, response_body FROM idempotency_keys WHERE business_id = $1::uuid AND key = $2`,
-				c.BusinessID, key).Scan(&storedHash, &status, &resp)
-			if err != nil || status == nil {
-				httpx.WriteError(w, http.StatusConflict, "idempotency_in_progress", "aynı anahtarlı istek hâlâ işleniyor; tekrar deneyin")
-				return
-			}
-			if !bytes.Equal(storedHash, hash[:]) {
-				httpx.WriteError(w, http.StatusUnprocessableEntity, "idempotency_key_reused", "bu anahtar farklı bir istekle daha önce kullanılmış")
-				return
-			}
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.Header().Set("Idempotent-Replay", "true")
-			w.WriteHeader(*status)
-			_, _ = w.Write(resp)
-			return
-		}
-	}
-
-	inv, err := invoicing.CreateTx(r.Context(), tx, invoicing.CreateParams{
-		BusinessID: c.BusinessID, UserID: c.UserID, Kind: req.Kind, ContactID: req.ContactID, Series: req.Series,
+	return invoicing.CreateParams{
+		BusinessID: businessID, UserID: userID, Kind: req.Kind, ContactID: req.ContactID, Series: req.Series,
 		IssueDate: issue, DueDate: due, IncludesVAT: req.PricesIncludeVAT, GeneralDiscount: req.GeneralDiscount, Lines: lines,
-	})
-	if err != nil {
-		s.writeInvoiceError(w, err)
-		return
-	}
-	respBytes, _ := json.Marshal(inv)
-	if key != "" {
-		if _, err := tx.Exec(r.Context(),
-			`UPDATE idempotency_keys SET status_code = $3, response_body = $4::jsonb WHERE business_id = $1::uuid AND key = $2`,
-			c.BusinessID, key, http.StatusCreated, respBytes); err != nil {
-			s.internalError(w, "idempotans", err)
-			return
-		}
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		s.writeInvoiceError(w, ledger.MapError(err))
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusCreated)
-	_, _ = w.Write(respBytes)
+	}, true
 }
 
-// writeInvoiceError alan hatalarını uygun HTTP koduna çevirir.
-func (s *Server) writeInvoiceError(w http.ResponseWriter, err error) {
+// handleCorrectInvoice bir ALIŞ faturasını düzeltir (eski iptal + yenisi), stok maliyetlerini yeniden hesaplar.
+func (s *Server) handleCorrectInvoice(w http.ResponseWriter, r *http.Request) {
+	c, _ := httpx.ClaimsFrom(r.Context())
+	id := chi.URLParam(r, "id")
+	if !isUUID(id) {
+		httpx.WriteError(w, http.StatusNotFound, "not_found", "fatura bulunamadı")
+		return
+	}
+	body, ok := httpx.ReadBody(w, r)
+	if !ok {
+		return
+	}
+	var req invoiceReq
+	if !httpx.DecodeBytes(w, body, &req) {
+		return
+	}
+	params, ok := s.invoiceParams(w, c.BusinessID, c.UserID, req)
+	if !ok {
+		return
+	}
+	cancelDate := time.Now().UTC().Truncate(24 * time.Hour)
+	if req.CancelDate != "" {
+		d, ok := parseDate(req.CancelDate)
+		if !ok {
+			httpx.WriteError(w, http.StatusBadRequest, "validation_error", "cancel_date YYYY-AA-GG biçiminde olmalı")
+			return
+		}
+		cancelDate = d
+	}
+	s.runIdempotent(w, r, body, c.BusinessID, func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return invoicing.CorrectAndFinalize(ctx, tx, id, params, cancelDate)
+	})
+}
+
+// writeDomainError alan hatalarını uygun HTTP koduna çevirir.
+func (s *Server) writeDomainError(w http.ResponseWriter, err error) {
+	err = payments.MapError(err)
 	var ve *invoicing.ValidationError
+	var ie *stock.InsufficientError
 	switch {
 	case errors.As(err, &ve):
 		status := http.StatusBadRequest
-		if ve.Code == "contact_not_found" {
+		if ve.Code == "contact_not_found" || ve.Code == "product_not_found" {
 			status = http.StatusNotFound
 		}
 		httpx.WriteError(w, status, ve.Code, ve.Msg)
+	case errors.As(err, &ie):
+		httpx.WriteError(w, http.StatusConflict, "insufficient_stock", ie.Error())
 	case errors.Is(err, ledger.ErrPeriodClosed):
 		httpx.WriteError(w, http.StatusConflict, "period_closed", "bu tarih kapatılmış bir döneme denk geliyor")
-	case errors.Is(err, invoicing.ErrNotFound):
-		httpx.WriteError(w, http.StatusNotFound, "not_found", "fatura bulunamadı")
-	case errors.Is(err, invoicing.ErrAlreadyCancelled):
+	case errors.Is(err, invoicing.ErrNotFound), errors.Is(err, payments.ErrNotFound):
+		httpx.WriteError(w, http.StatusNotFound, "not_found", "kayıt bulunamadı")
+	case errors.Is(err, invoicing.ErrAlreadyCancelled), errors.Is(err, ledger.ErrAlreadyReversed):
 		httpx.WriteError(w, http.StatusConflict, "already_cancelled", "fatura zaten iptal edilmiş")
-	case errors.Is(err, ledger.ErrAlreadyReversed):
-		httpx.WriteError(w, http.StatusConflict, "already_cancelled", "fatura zaten iptal edilmiş")
+	case errors.Is(err, invoicing.ErrHasPayments):
+		httpx.WriteError(w, http.StatusConflict, "has_payments", "fatura mahsup edilmiş; önce ilgili tahsilat/ödemeyi silin")
+	case errors.Is(err, payments.ErrAlreadyDeleted):
+		httpx.WriteError(w, http.StatusConflict, "already_deleted", "ödeme zaten silinmiş")
+	case errors.Is(err, payments.ErrNoAdvance):
+		httpx.WriteError(w, http.StatusConflict, "no_advance", "mahsup edilecek avans yok")
+	case errors.Is(err, payments.ErrAllocationLimit):
+		httpx.WriteError(w, http.StatusConflict, "allocation_limit", "mahsup tutarı sınırı aşıldı")
 	default:
-		s.internalError(w, "fatura", err)
+		s.internalError(w, "istek", err)
 	}
 }
 
@@ -178,7 +169,7 @@ func (s *Server) handleGetInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	inv, err := invoicing.Get(r.Context(), s.pool, c.BusinessID, id)
 	if err != nil {
-		s.writeInvoiceError(w, err)
+		s.writeDomainError(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, inv)
@@ -237,17 +228,17 @@ func (s *Server) handleCancelInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context()) //nolint:errcheck
-	if err := invoicing.CancelTx(r.Context(), tx, c.BusinessID, c.UserID, id, date); err != nil {
-		s.writeInvoiceError(w, err)
+	if err := invoicing.CancelAndFinalize(r.Context(), tx, c.BusinessID, c.UserID, id, date); err != nil {
+		s.writeDomainError(w, err)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		s.writeInvoiceError(w, ledger.MapError(err))
+		s.writeDomainError(w, ledger.MapError(err))
 		return
 	}
 	inv, err := invoicing.Get(r.Context(), s.pool, c.BusinessID, id)
 	if err != nil {
-		s.writeInvoiceError(w, err)
+		s.writeDomainError(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, inv)
@@ -262,7 +253,7 @@ func (s *Server) handleInvoiceJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := invoicing.Get(r.Context(), s.pool, c.BusinessID, id); err != nil {
-		s.writeInvoiceError(w, err)
+		s.writeDomainError(w, err)
 		return
 	}
 	rows, err := s.pool.Query(r.Context(),
@@ -313,5 +304,3 @@ func (s *Server) handleInvoiceJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"entries": out})
 }
-
-var _ = pgx.ErrNoRows
