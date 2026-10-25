@@ -10,13 +10,16 @@ import (
 )
 
 // Connect bir havuz açar ve veritabanı hazır olana kadar (en fazla ~30 sn) yeniden dener.
-func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
+func Connect(ctx context.Context, url string, opts ...func(*pgxpool.Config)) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("DATABASE_URL çözümlenemedi: %w", err)
 	}
 	cfg.MaxConns = 20
 	cfg.MaxConnLifetime = time.Hour
+	for _, o := range opts {
+		o(cfg)
+	}
 
 	var lastErr error
 	for i := 0; i < 15; i++ {
