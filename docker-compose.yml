@@ -35,6 +35,22 @@ services:
       retries: 20
       start_period: 5s
 
+  # Arayüz: statik dosyalar (nginx, root olmayan kullanıcı) + /api -> backend yönlendirmesi.
+  frontend:
+    build: ./frontend
+    image: esnafdefter/frontend:local
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
   # Veri üretici: önce deterministik seed (aynı tohum = aynı veri), ardından canlı olay akışı.
   # Seed arka planda sürer; API ve arayüz bu sırada kullanılabilir.
   simulator:

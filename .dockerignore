@@ -4,3 +4,6 @@ go.sandbox.mod
 go.sandbox.sum
 bin
 *.md
+frontend
+loadtest
+docs

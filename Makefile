@@ -1,7 +1,7 @@
 # Windows'ta make yoksa doğrudan docker compose komutlarını kullanın (TESTING.md'de listelidir).
 .PHONY: up down logs test verify reset-demo load lint tidy
 
-up:            ## Her şeyi derle ve başlat (frontend :3000, API :8080)
+up:            ## Her şeyi derle ve başlat (arayüz http://localhost:3000, API :8080)
 	docker compose up --build
 
 down:          ## Durdur (veriyi korur)
