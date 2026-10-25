@@ -2,6 +2,7 @@ import { api, qs, uuid } from '../api.js';
 import { h, clear, money, parseMoney, fmtDate, todayISO, toast, badge, table, loadInto, openModal, confirmDialog, combo, field, seg } from '../ui.js';
 import { pagedList } from '../paged.js';
 import { openInvoice } from './invoices.js';
+import { renderAudit } from './auditview.js';
 
 const METHOD = { cash: 'Kasa', bank: 'Banka' };
 export const payKind = (k) => badge(k === 'receipt' ? 'Tahsilat' : 'Ödeme', k === 'receipt' ? 'ok' : 'warn');
@@ -56,7 +57,8 @@ export function openPayment(id, ctx, onChange) {
         h('div', {}, h('h1', { text: money(p.amount) }), h('p', { class: 'subtle' }, payKind(p.kind), ' ', paymentStatus(p))),
         h('div', { class: 'actions' },
           ctx.can.books && p.status === 'active' && p.advance > 0 ? h('button', { class: 'btn secondary', type: 'button', onClick: () => applyAdvance(p), text: 'Avansı mahsup et' }) : null,
-          ctx.can.books && p.status === 'active' ? h('button', { class: 'btn danger', type: 'button', onClick: () => del(p), text: 'Sil' }) : null)),
+          ctx.can.books && p.status === 'active' ? h('button', { class: 'btn danger', type: 'button', onClick: () => del(p), text: 'Sil' }) : null,
+          ctx.can.books ? h('button', { class: 'btn secondary', type: 'button', onClick: () => renderAudit(box.querySelector('.abox'), 'payment', id), text: 'Denetim izi' }) : null)),
       h('div', { class: 'row' },
         h('div', { class: 'field' }, h('div', { class: 'muted', text: 'Cari' }), h('a', { href: '#/cariler/' + p.contact_id, onClick: () => m.close(), text: p.contact_name })),
         h('div', { class: 'field' }, h('div', { class: 'muted', text: 'Tarih' }), fmtDate(p.date)),
@@ -68,7 +70,8 @@ export function openPayment(id, ctx, onChange) {
         table([
           { label: 'Fatura', render: (a) => h('a', { href: '#', class: 'mono', onClick: (e) => { e.preventDefault(); openInvoice(a.invoice_id, ctx, load); }, text: a.invoice_number }) },
           { label: 'Mahsup tutarı', cls: 'num', render: (a) => money(a.amount) },
-        ], p.allocations));
+        ], p.allocations),
+      h('div', { class: 'abox' }));
   }
   async function del(p) {
     if (!(await confirmDialog('Bu ödeme silinsin mi? Mahsuplar geri alınır ve faturalar yeniden açılır.', { confirmText: 'Ödemeyi sil', danger: true }))) return;

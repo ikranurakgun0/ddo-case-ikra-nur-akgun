@@ -250,6 +250,14 @@ Authorization: Bearer {{token}}
 GET {{host}}/contacts/{{musteri}}/statement
 Authorization: Bearer {{token}}
 
+### Denetim kaydı: bir faturanın kim/ne zaman/neyi/eski-yeni değer izi (sahip/muhasebeci)
+GET {{host}}/audit-log?entity=invoice&entity_id={{satisFatura}}
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/audit-log?action=period_close&limit=10
+Authorization: Bearer {{token}}
+
 ### Kapalı dönem bilgisi
 GET {{host}}/periods
 Authorization: Bearer {{token}}

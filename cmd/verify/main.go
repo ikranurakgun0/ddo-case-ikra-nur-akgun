@@ -80,6 +80,7 @@ func main() {
 		{"T-3", "Tahsilat mahsubu (FIFO, avans, silme), vade yaşlandırma, eşzamanlı ödemeler", checkT3},
 		{"T-4", "Ağırlıklı ortalama maliyet, geçmişe dönük yeniden hesap, negatif stok, eşzamanlı satış", checkT4},
 		{"IDEMPOTENCY", "Idempotency-Key: tekrar istek aynı sonucu döndürür (fatura + ödeme, eşzamanlı)", checkIdempotency},
+		{"AUDIT", "Denetim kaydı: kritik işlemler (kim, ne zaman, neyi, eski/yeni değer) yazılır; başarısız işlem iz bırakmaz; yalnızca owner/accountant okur", checkAudit},
 	}
 
 	start := time.Now()

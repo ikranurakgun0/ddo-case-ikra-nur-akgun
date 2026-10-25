@@ -122,6 +122,9 @@ def _():
     # 2,5 x 1250,50 = 3126,25 net + %20 KDV 625,25 = 3751,50
     assert '3.126,25' in t and '3.751,50' in t, t[-600:]
     shot('08_fatura_olustu')
+    [b for b in css('.modal button') if b.text == 'Denetim izi'][0].click()
+    W().until(lambda d: 'Fatura oluşturuldu' in text())
+    assert 'Fatura oluşturuldu' in text(), 'denetim izinde oluşturma kaydı olmalı'; shot('08b_denetim_izi')
     drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
 
 @step('Yeni fatura: doğrulama hataları gösteriliyor')

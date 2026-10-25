@@ -2,6 +2,7 @@ import { api, qs, uuid } from '../api.js';
 import { h, clear, money, parseMoney, parseQty, fmtQty, fmtDate, fmtDateTime, todayISO, addDays, toast, badge, table,
   loadInto, openModal, confirmDialog, combo, field, seg, ACCOUNTS } from '../ui.js';
 import { pagedList } from '../paged.js';
+import { renderAudit } from './auditview.js';
 
 export function invoiceStatus(inv) {
   if (inv.status === 'cancelled') return badge('İptal', 'gray');
@@ -64,7 +65,8 @@ export function openInvoice(id, ctx, onChange) {
           h('p', { class: 'subtle' }, kindBadge(inv.kind), ' ', invoiceStatus(inv))),
         h('div', { class: 'actions' },
           ctx.can.books && inv.status === 'issued' ? h('button', { class: 'btn danger', type: 'button', onClick: () => cancel(inv), text: 'İptal et' }) : null,
-          ctx.can.books ? h('button', { class: 'btn secondary', type: 'button', onClick: () => journal(inv), text: 'Yevmiye kayıtları' }) : null)),
+          ctx.can.books ? h('button', { class: 'btn secondary', type: 'button', onClick: () => journal(inv), text: 'Yevmiye kayıtları' }) : null,
+          ctx.can.books ? h('button', { class: 'btn secondary', type: 'button', onClick: () => renderAudit(box.querySelector('.jbox'), 'invoice', id), text: 'Denetim izi' }) : null)),
       h('div', { class: 'row' },
         info('Cari', h('a', { href: '#/cariler/' + inv.contact_id, onClick: () => m.close(), text: inv.contact_name })),
         info('Fatura tarihi', fmtDate(inv.issue_date)),

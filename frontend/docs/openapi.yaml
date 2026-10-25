@@ -27,6 +27,7 @@ tags:
   - name: Faturalar
   - name: Tahsilat ve ödeme
   - name: Muhasebe ve raporlar
+  - name: Denetim
   - name: Ayarlar
 security:
   - bearer: []
@@ -494,6 +495,44 @@ paths:
         - { name: detail, in: query, schema: { type: string, enum: ['1'] }, description: fatura satırlarını da döndürür }
       responses:
         '200': { description: Rapor }
+  /audit-log:
+    get:
+      tags: [Denetim]
+      summary: Denetim kaydı (kim, ne zaman, neyi, eski/yeni değer) — eklemeli-yalnız tablo
+      description: |
+        Kritik işlemler (fatura oluşturma/iptal/düzeltme, ödeme kaydı/silme/avans mahsubu, dönem kapatma, cari/ürün oluşturma,
+        ayar değişikliği, stok maliyeti yeniden hesabı, giriş) işle **aynı transaction'da** yazılır; başarısız işlem iz bırakmaz.
+        Tabloda UPDATE/DELETE/TRUNCATE veritabanı tetikleyicisiyle engellidir. Roller owner, accountant.
+      parameters:
+        - { name: entity, in: query, schema: { type: string, enum: [invoice, payment, contact, product, period, user, stock_movement, business_settings] } }
+        - { name: entity_id, in: query, schema: { type: string } }
+        - { name: action, in: query, schema: { type: string }, description: "örn. invoice_cancel" }
+        - $ref: '#/components/parameters/Limit'
+        - { name: after, in: query, schema: { type: integer }, description: Son görülen kayıt id'si (yeniden eskiye gidilir) }
+      responses:
+        '200':
+          description: Sayfa
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next_after: { type: string, nullable: true }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        at: { type: string, format: date-time }
+                        actor_id: { type: string }
+                        actor_email: { type: string }
+                        action: { type: string }
+                        entity: { type: string }
+                        entity_id: { type: string }
+                        old_value: { type: object, nullable: true }
+                        new_value: { type: object, nullable: true }
+        '403': { $ref: '#/components/responses/Error' }
   /periods:
     get:
       tags: [Muhasebe ve raporlar]

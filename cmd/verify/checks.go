@@ -546,3 +546,60 @@ func checkIdempotency(e *env) {
 	st := e.c.do("GET", "/contacts/"+cust+"/statement", e.owner, nil, nil).must(200, "ekstre")
 	expect(st.num("balance") == 12000-5000, "ekstre bakiyesi 7000 olmalı (tek ödeme): %d", st.num("balance"))
 }
+
+// auditRows /audit-log çıktısını (yeniden eskiye) döner.
+func (e *env) auditRows(query string) []map[string]any {
+	r := e.c.do("GET", "/audit-log"+query, e.owner, nil, nil).must(200, "denetim kaydı")
+	var out []map[string]any
+	for _, it := range r.arr("items") {
+		out = append(out, it.(map[string]any))
+	}
+	return out
+}
+
+func checkAudit(e *env) {
+	cust := e.contact("customer")
+	rows := e.auditRows("?entity=contact&entity_id=" + cust)
+	expect(len(rows) == 1 && rows[0]["action"] == "contact_create", "cari oluşturma denetlenmeli: %v", rows)
+
+	inv := e.invoice(invBody("sale", cust, day(0), day(30), line("x", "2", 10000, 20))) // brüt 24000
+	rows = e.auditRows("?entity=invoice&entity_id=" + inv.str("id"))
+	expect(len(rows) == 1 && rows[0]["action"] == "invoice_create", "fatura oluşturma denetlenmeli: %v", rows)
+	r := rows[0]
+	expect(r["actor_email"] == sim.DemoEmail("owner", verifyBusiness), "kim: %v", r["actor_email"])
+	expect(r["at"] != nil && r["at"] != "", "ne zaman eksik")
+	nv, _ := r["new_value"].(map[string]any)
+	expect(nv["number"] == inv.str("number") && num(nv, "gross_total") == 24000, "neyi/yeni değer: %v", nv)
+
+	e.c.do("POST", "/invoices/"+inv.str("id")+"/cancel", e.acct, nil, nil).must(200, "iptal")
+	rows = e.auditRows("?entity=invoice&entity_id=" + inv.str("id"))
+	expect(len(rows) == 2 && rows[0]["action"] == "invoice_cancel", "iptal denetlenmeli (en üstte): %v", rows)
+	ov, _ := rows[0]["old_value"].(map[string]any)
+	nw, _ := rows[0]["new_value"].(map[string]any)
+	expect(ov["status"] == "issued" && nw["status"] == "cancelled", "eski/yeni değer: %v → %v", ov, nw)
+	expect(rows[0]["actor_email"] == sim.DemoEmail("accountant", verifyBusiness), "iptali yapan muhasebeci olmalı: %v", rows[0]["actor_email"])
+
+	p := e.pay("receipt", cust, "bank", day(0), 5000).must(201, "tahsilat")
+	e.c.do("DELETE", "/payments/"+p.str("id"), e.acct, nil, nil).must(200, "silme")
+	rows = e.auditRows("?entity=payment&entity_id=" + p.str("id"))
+	expect(len(rows) == 2 && rows[0]["action"] == "payment_delete" && rows[1]["action"] == "payment_create", "ödeme kayıtları: %v", rows)
+
+	// Başarısız işlem iz bırakmaz (aynı transaction): kapalı döneme fatura reddedilir
+	top := func() float64 {
+		r := e.auditRows("?action=invoice_create&limit=1")
+		if len(r) == 0 {
+			return 0
+		}
+		return r[0]["id"].(float64)
+	}
+	before := top()
+	e.c.do("POST", "/invoices", e.owner, invBody("sale", cust, "2026-02-10", "2026-03-10", line("x", "1", 1000, 20)), nil).must(409, "kapalı dönem")
+	e.c.do("POST", "/invoices", e.owner, invBody("sale", cust, day(0), day(30), line("x", "1", 1000, 18)), nil).must(400, "geçersiz KDV")
+	expect(top() == before, "başarısız işlemler denetim kaydı bırakmamalı")
+
+	// Erişim: yalnızca owner/accountant
+	e.c.do("GET", "/audit-log", e.emp, nil, nil).must(403, "çalışan denetim kaydını göremez")
+	e.c.do("GET", "/audit-log", e.cust, nil, nil).must(403, "müşteri denetim kaydını göremez")
+	e.c.do("GET", "/audit-log", e.acct, nil, nil).must(200, "muhasebeci denetim kaydını görebilir")
+	e.c.do("GET", "/audit-log", "", nil, nil).must(401, "belirteçsiz")
+}
