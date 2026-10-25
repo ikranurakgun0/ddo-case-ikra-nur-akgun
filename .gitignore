@@ -1,0 +1,6 @@
+.env
+go.sandbox.mod
+go.sandbox.sum
+bin/
+*.test
+coverage.out
