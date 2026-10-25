@@ -85,3 +85,15 @@ func CreateUser(t testing.TB, pool *pgxpool.Pool, businessID, email, password st
 	}
 	return u
 }
+
+// CreateContact bir cari ekler ve kimliğini döner.
+func CreateContact(t testing.TB, pool *pgxpool.Pool, businessID, kind, name string) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO contacts(business_id, kind, name) VALUES ($1::uuid,$2,$3) RETURNING id::text`,
+		businessID, kind, name).Scan(&id); err != nil {
+		t.Fatalf("cari: %v", err)
+	}
+	return id
+}

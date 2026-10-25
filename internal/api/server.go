@@ -53,6 +53,24 @@ func (s *Server) Routes() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(httpx.Authenticate(s.issuer))
 		r.Get("/me", s.handleMe)
+
+		// Rol matrisi: her uç nokta yalnızca kendi rollerine açıktır (sunucu tarafında zorlanır).
+		staff := httpx.RequireRole(auth.RoleOwner, auth.RoleAccountant, auth.RoleEmployee)
+		books := httpx.RequireRole(auth.RoleOwner, auth.RoleAccountant)
+
+		r.With(staff).Post("/contacts", s.handleCreateContact)
+		r.With(staff).Get("/contacts", s.handleListContacts)
+		r.With(staff).Get("/contacts/{id}", s.handleGetContact)
+
+		r.With(staff).Post("/invoices", s.handleCreateInvoice)
+		r.With(staff).Get("/invoices", s.handleListInvoices)
+		r.With(staff).Get("/invoices/{id}", s.handleGetInvoice)
+		r.With(books).Post("/invoices/{id}/cancel", s.handleCancelInvoice)
+		r.With(books).Get("/invoices/{id}/journal", s.handleInvoiceJournal)
+
+		r.With(books).Get("/periods", s.handleGetPeriods)
+		r.With(books).Post("/periods/close", s.handleClosePeriod)
+		r.With(books).Get("/reports/trial-balance", s.handleTrialBalance)
 	})
 	return r
 }

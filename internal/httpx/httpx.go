@@ -2,10 +2,12 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -46,6 +48,28 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", "istek gövdesi geçersiz")
+		return false
+	}
+	return true
+}
+
+// ReadBody gövdeyi (en fazla 1 MiB) bayt olarak okur; idempotans özeti için ham bayt gerekir.
+func ReadBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid_json", "istek gövdesi okunamadı veya çok büyük")
+		return nil, false
+	}
+	return b, true
+}
+
+// DecodeBytes ReadBody ile okunmuş gövdeyi çözer; bilinmeyen alanları reddeder.
+func DecodeBytes(w http.ResponseWriter, b []byte, dst any) bool {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil || dec.More() {
 		WriteError(w, http.StatusBadRequest, "invalid_json", "istek gövdesi geçersiz")
 		return false
 	}
