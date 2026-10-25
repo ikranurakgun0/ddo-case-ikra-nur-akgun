@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"esnafdefter/internal/audit"
 	"esnafdefter/internal/httpx"
 	"esnafdefter/internal/ledger"
 )
@@ -28,11 +29,37 @@ func (s *Server) handleClosePeriod(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "gelecekteki bir tarihe kadar dönem kapatılamaz")
 		return
 	}
-	if err := ledger.ClosePeriod(r.Context(), s.pool, c.BusinessID, through); err != nil {
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		s.internalError(w, "dönem kapatma", err)
+		return
+	}
+	defer tx.Rollback(r.Context()) //nolint:errcheck
+	prev, err := ledger.ClosedThrough(r.Context(), tx, c.BusinessID)
+	if err != nil {
+		s.internalError(w, "dönem kapatma", err)
+		return
+	}
+	if err := ledger.ClosePeriod(r.Context(), tx, c.BusinessID, through); err != nil {
 		if errors.Is(err, ledger.ErrNotAdvancing) {
 			httpx.WriteError(w, http.StatusConflict, "period_not_advancing", "kapanış tarihi mevcut kapanıştan ileri olmalı; kapatılmış dönem yeniden açılamaz")
 			return
 		}
+		s.internalError(w, "dönem kapatma", err)
+		return
+	}
+	var old any
+	if prev != nil {
+		old = map[string]any{"closed_through": prev.Format("2006-01-02")}
+	}
+	if err := audit.Write(r.Context(), tx, audit.Entry{
+		BusinessID: c.BusinessID, ActorID: c.UserID, Action: "period_close", Entity: "period", EntityID: c.BusinessID,
+		Old: old, New: map[string]any{"closed_through": req.Through},
+	}); err != nil {
+		s.internalError(w, "dönem kapatma", err)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		s.internalError(w, "dönem kapatma", err)
 		return
 	}

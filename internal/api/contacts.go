@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 
+	"esnafdefter/internal/audit"
 	"esnafdefter/internal/httpx"
 )
 
@@ -50,10 +51,23 @@ func (s *Server) handleCreateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := contact{Kind: req.Kind, Name: req.Name, TaxNo: req.TaxNo, Email: req.Email, Phone: req.Phone}
-	err := s.pool.QueryRow(r.Context(),
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		s.internalError(w, "cari ekleme", err)
+		return
+	}
+	defer tx.Rollback(r.Context()) //nolint:errcheck
+	err = tx.QueryRow(r.Context(),
 		`INSERT INTO contacts(business_id, kind, name, tax_no, email, phone)
 		 VALUES ($1::uuid,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,'')) RETURNING id::text`,
 		c.BusinessID, req.Kind, req.Name, req.TaxNo, req.Email, req.Phone).Scan(&out.ID)
+	if err == nil {
+		err = audit.Write(r.Context(), tx, audit.Entry{BusinessID: c.BusinessID, ActorID: c.UserID, Action: "contact_create",
+			Entity: "contact", EntityID: out.ID, New: map[string]any{"kind": req.Kind, "name": req.Name, "tax_no": req.TaxNo}})
+	}
+	if err == nil {
+		err = tx.Commit(r.Context())
+	}
 	if err != nil {
 		s.internalError(w, "cari ekleme", err)
 		return

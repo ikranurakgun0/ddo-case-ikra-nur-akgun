@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"esnafdefter/internal/audit"
 	"esnafdefter/internal/invoicing"
 	"esnafdefter/internal/ledger"
 )
@@ -216,6 +217,13 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Payment, error) 
 	if _, err := ledger.Post(ctx, tx, e); err != nil {
 		return nil, err
 	}
+	if err := audit.Write(ctx, tx, audit.Entry{
+		BusinessID: p.BusinessID, ActorID: p.UserID, Action: "payment_create", Entity: "payment", EntityID: pay.ID,
+		New: map[string]any{"kind": p.Kind, "contact_id": p.ContactID, "method": p.Method, "date": pay.Date,
+			"amount": p.Amount, "allocated": pay.Allocated, "advance": pay.Advance, "invoices": len(pay.Allocations)},
+	}); err != nil {
+		return nil, err
+	}
 	return pay, nil
 }
 
@@ -264,6 +272,12 @@ func ApplyAdvanceTx(ctx context.Context, tx pgx.Tx, businessID, userID, paymentI
 			e.Lines = []ledger.Line{{Account: "320", Debit: moved, ContactID: contactID}, {Account: "159", Credit: moved, ContactID: contactID}}
 		}
 		if _, err := ledger.Post(ctx, tx, e); err != nil {
+			return nil, err
+		}
+		if err := audit.Write(ctx, tx, audit.Entry{
+			BusinessID: businessID, ActorID: userID, Action: "payment_apply_advance", Entity: "payment", EntityID: paymentID,
+			Old: map[string]any{"advance": advance}, New: map[string]any{"advance": advance - moved, "applied": moved},
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -320,8 +334,13 @@ func DeleteTx(ctx context.Context, tx pgx.Tx, businessID, userID, paymentID stri
 	if _, err := tx.Exec(ctx, `UPDATE payment_allocations SET reversed_at = now() WHERE payment_id = $1::uuid AND reversed_at IS NULL`, paymentID); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE payments SET status = 'deleted', deleted_at = now() WHERE id = $1::uuid`, paymentID)
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE payments SET status = 'deleted', deleted_at = now() WHERE id = $1::uuid`, paymentID); err != nil {
+		return err
+	}
+	return audit.Write(ctx, tx, audit.Entry{
+		BusinessID: businessID, ActorID: userID, Action: "payment_delete", Entity: "payment", EntityID: paymentID,
+		Old: map[string]any{"status": "active"}, New: map[string]any{"status": "deleted", "reversal_date": date.Format(dateLayout)},
+	})
 }
 
 const paymentCols = `p.id::text, p.kind, p.contact_id::text, p.method, p.pay_date, p.amount, p.status, p.created_at,

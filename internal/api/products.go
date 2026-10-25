@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"esnafdefter/internal/audit"
 	"esnafdefter/internal/httpx"
 	"esnafdefter/internal/invoicing"
 	"esnafdefter/internal/stock"
@@ -67,10 +68,23 @@ func (s *Server) handleCreateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := product{SKU: req.SKU, Name: req.Name, Kind: req.Kind, Unit: req.Unit, VATRate: req.VATRate, SalePrice: req.SalePrice}
-	err := s.pool.QueryRow(r.Context(),
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		s.internalError(w, "ürün ekleme", err)
+		return
+	}
+	defer tx.Rollback(r.Context()) //nolint:errcheck
+	err = tx.QueryRow(r.Context(),
 		`INSERT INTO products(business_id, sku, name, kind, unit, vat_rate, sale_price)
 		 VALUES ($1::uuid,$2,$3,$4,$5,$6,$7) RETURNING id::text`,
 		c.BusinessID, req.SKU, req.Name, req.Kind, req.Unit, req.VATRate, req.SalePrice).Scan(&out.ID)
+	if err == nil {
+		err = audit.Write(r.Context(), tx, audit.Entry{BusinessID: c.BusinessID, ActorID: c.UserID, Action: "product_create",
+			Entity: "product", EntityID: out.ID, New: map[string]any{"sku": req.SKU, "name": req.Name, "kind": req.Kind, "vat_rate": req.VATRate, "sale_price": req.SalePrice}})
+	}
+	if err == nil {
+		err = tx.Commit(r.Context())
+	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) && pe.Code == "23505" {
 		httpx.WriteError(w, http.StatusConflict, "duplicate_sku", "bu sku zaten kullanılıyor")

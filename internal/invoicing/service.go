@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"esnafdefter/internal/audit"
 	"esnafdefter/internal/ledger"
 	"esnafdefter/internal/stock"
 )
@@ -139,6 +140,12 @@ func CorrectAndFinalize(ctx context.Context, tx pgx.Tx, originalID string, p Cre
 		return nil, err
 	}
 	if err := stock.Finalize(ctx, tx, p.BusinessID, p.UserID, touched, cancelDate); err != nil {
+		return nil, err
+	}
+	if err := audit.Write(ctx, tx, audit.Entry{
+		BusinessID: p.BusinessID, ActorID: p.UserID, Action: "invoice_correct", Entity: "invoice", EntityID: originalID,
+		Old: map[string]any{"invoice_id": originalID}, New: map[string]any{"invoice_id": inv.ID, "number": inv.Number, "gross_total": inv.GrossTotal},
+	}); err != nil {
 		return nil, err
 	}
 	return inv, nil
@@ -295,6 +302,13 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams, touched stock.Set)
 	if _, err := ledger.Post(ctx, tx, entry); err != nil {
 		return nil, err
 	}
+	if err := audit.Write(ctx, tx, audit.Entry{
+		BusinessID: p.BusinessID, ActorID: p.UserID, Action: "invoice_create", Entity: "invoice", EntityID: inv.ID,
+		New: map[string]any{"number": inv.Number, "kind": p.Kind, "contact_id": p.ContactID, "issue_date": inv.IssueDate,
+			"net_total": res.Net, "vat_total": res.VAT, "gross_total": res.Gross, "lines": len(res.Lines)},
+	}); err != nil {
+		return nil, err
+	}
 	return inv, nil
 }
 
@@ -355,8 +369,13 @@ func CancelTx(ctx context.Context, tx pgx.Tx, businessID, userID, invoiceID stri
 	for _, id := range pids {
 		touched.Add(id)
 	}
-	_, err = tx.Exec(ctx, `UPDATE invoices SET status = 'cancelled', cancelled_at = now() WHERE id = $1::uuid`, invoiceID)
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE invoices SET status = 'cancelled', cancelled_at = now() WHERE id = $1::uuid`, invoiceID); err != nil {
+		return err
+	}
+	return audit.Write(ctx, tx, audit.Entry{
+		BusinessID: businessID, ActorID: userID, Action: "invoice_cancel", Entity: "invoice", EntityID: invoiceID,
+		Old: map[string]any{"status": "issued"}, New: map[string]any{"status": "cancelled", "reversal_date": date.Format(dateLayout)},
+	})
 }
 
 const invoiceCols = `id::text, kind, series, year, number, contact_id::text, issue_date, due_date, status,

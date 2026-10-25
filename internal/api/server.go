@@ -92,6 +92,7 @@ func (s *Server) Routes() http.Handler {
 		r.With(httpx.RequireRole(auth.RoleOwner)).Get("/settings", s.handleGetSettings)
 		r.With(httpx.RequireRole(auth.RoleOwner)).Put("/settings", s.handleUpdateSettings)
 
+		r.With(books).Get("/audit-log", s.handleAuditLog)
 		r.With(books).Get("/periods", s.handleGetPeriods)
 		r.With(books).Post("/periods/close", s.handleClosePeriod)
 		r.With(books).Get("/reports/trial-balance", s.handleTrialBalance)
