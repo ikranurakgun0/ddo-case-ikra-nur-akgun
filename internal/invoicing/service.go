@@ -408,11 +408,12 @@ func Get(ctx context.Context, q ledger.Querier, businessID, id string) (*Invoice
 }
 
 // List keyset sayfalama kullanır (id'ye göre artan; after = önceki sayfanın son id'si).
-func List(ctx context.Context, q ledger.Querier, businessID, after string, limit int) ([]Invoice, error) {
+// series boş değilse yalnızca o seriye ait faturalar listelenir.
+func List(ctx context.Context, q ledger.Querier, businessID, after, series string, limit int) ([]Invoice, error) {
 	rows, err := q.Query(ctx,
 		`SELECT `+invoiceCols+` FROM invoices
-		  WHERE business_id = $1::uuid AND ($2 = '' OR id > $2::uuid)
-		  ORDER BY id LIMIT $3`, businessID, after, limit)
+		  WHERE business_id = $1::uuid AND ($2 = '' OR id > $2::uuid) AND ($4 = '' OR series = $4)
+		  ORDER BY id LIMIT $3`, businessID, after, limit, series)
 	if err != nil {
 		return nil, err
 	}

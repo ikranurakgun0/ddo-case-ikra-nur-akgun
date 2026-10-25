@@ -181,7 +181,7 @@ func (s *Server) handleListInvoices(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := invoicing.List(r.Context(), s.pool, c.BusinessID, after, limit+1)
+	items, err := invoicing.List(r.Context(), s.pool, c.BusinessID, after, r.URL.Query().Get("series"), limit+1)
 	if err != nil {
 		s.internalError(w, "fatura listesi", err)
 		return

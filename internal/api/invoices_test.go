@@ -640,3 +640,24 @@ func TestContactValidationAndPagination(t *testing.T) {
 		t.Errorf("limit sınırı: %d", code)
 	}
 }
+
+func TestListInvoicesFilterBySeries(t *testing.T) {
+	e := setup(t)
+	tok := e.token(e.user)
+	cid := e.newContact(t, tok, "customer")
+	e.newInvoice(t, tok, saleBody(cid, "2026-10-10"))
+	b := saleBody(cid, "2026-10-10")
+	b["series"] = "XYZ"
+	e.newInvoice(t, tok, b)
+	e.newInvoice(t, tok, b)
+	_, m, _ := e.call("GET", "/invoices?series=XYZ", nil, tok, nil)
+	items := m["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("yalnızca XYZ serisi dönmeli: %d", len(items))
+	}
+	for _, it := range items {
+		if it.(map[string]any)["series"] != "XYZ" {
+			t.Fatalf("başka seri sızdı: %v", it)
+		}
+	}
+}
