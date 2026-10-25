@@ -1,0 +1,3 @@
+# Satır sonları her ortamda LF olsun (Windows'ta CRLF'e dönüp Docker'da betikleri bozmasın)
+* text=auto eol=lf
+*.png binary

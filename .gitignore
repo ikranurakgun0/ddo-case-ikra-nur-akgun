@@ -4,3 +4,4 @@ go.sandbox.sum
 bin/
 *.test
 coverage.out
+*.zip
