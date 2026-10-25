@@ -76,13 +76,16 @@ Go servisi katmanlıdır; **iş kuralları paketlerde, kısıt güvencesi verita
 | `internal/payments` | Tahsilat/ödeme, FIFO mahsup, avans, silme, vade yaşlandırma, ekstre |
 | `internal/stock` | Ağırlıklı ortalama maliyet (baştan oynatma), stok hareketleri, negatif stok politikası |
 | `internal/api`, `httpx` | HTTP uçları, RBAC, hata biçimi, idempotans, keyset sayfalama |
+| `internal/audit` | Denetim kaydı yazıcısı (işle aynı transaction'da) |
 | `internal/auth` | argon2id parola özeti, JWT (access) + yenileme belirteci (rotasyon) |
 | `internal/sim` | Deterministik veri üretici ve canlı olay akışı |
-| `internal/db/migrations` | Sürümlü şema (7 migrasyon); tetikleyiciler ve kısıtlar burada |
+| `internal/db/migrations` | Sürümlü şema (8 migrasyon); tetikleyiciler ve kısıtlar burada |
 
 **Veritabanı güvenceleri** (uygulama hatası yapsa bile bozuk veri girmesin): borç=alacak (ertelenmiş constraint trigger),
 değiştirilemez yevmiye/fatura/stok hareketi/denetim kaydı (UPDATE/DELETE/TRUNCATE engelli), kapalı dönem kilidi, mahsup sınırı,
-fatura toplamı = satır toplamı, bileşik yabancı anahtarlarla işletmeler arası izolasyon. Paralar `bigint` kuruştur, `float` yoktur.
+fatura toplamı = satır toplamı, bileşik yabancı anahtarlarla işletmeler arası izolasyon, **denetim kaydı** (aşağıda). Paralar `bigint` kuruştur, `float` yoktur.
+
+**Denetim kaydı:** kritik işlemler (fatura oluşturma/iptal/düzeltme, ödeme kaydı/silme/avans mahsubu, dönem kapatma, cari/ürün oluşturma, ayar değişikliği, stok maliyeti yeniden hesabı, giriş) **kim, ne zaman, neyi, eski/yeni değer** olarak eklemeli-yalnız `audit_log` tablosuna yazılır. Kayıt, işle **aynı transaction'dadır**: işlem geri alınırsa kayıt da kalmaz, başarılıysa mutlaka vardır (testlerle doğrulandı). Tabloda UPDATE/DELETE/TRUNCATE tetikleyiciyle engellidir. Sahip ve muhasebeci `GET /audit-log` ile ya da fatura/ödeme detayındaki "Denetim izi" düğmesiyle görür.
 
 **Güvenlik:** her uçta sunucu tarafı rol denetimi (401/403; başka işletmenin verisi 404), argon2id, yenileme belirteci rotasyonu ve
 yeniden kullanım tespiti, yapılandırılmış JSON log (parola/belirteç asla loglanmaz), katı CSP, konteynerlerde root olmayan kullanıcı,
@@ -96,7 +99,7 @@ yeniden kullanım tespiti, yapılandırılmış JSON log (parola/belirteç asla 
   XSS yok ve `script-src 'self'` gibi katı bir CSP uygulanabiliyor. Bedeli: bileşen kütüphanesi/tip güvenliği yok (ayrıntı: K-8).
 * **Kendi migrasyon çalıştırıcım** (`embed` + danışma kilidi); `goose` bağımlılığı yok (K-7).
 
-Kararların tam kaydı (bağlam, seçenekler, karar, sonuç): **[DECISIONS.md](DECISIONS.md)** (9 karar).
+Kararların tam kaydı (bağlam, seçenekler, karar, sonuç): **[DECISIONS.md](DECISIONS.md)** (10 karar).
 
 ### Kapsam
 
@@ -111,8 +114,8 @@ Müşteri rolü yalnızca kendi salt okunur ekstresini görür.
 
 | Ne | Sonuç |
 |---|---|
-| Go testleri | **121 test**, hepsi geçiyor; `api` (72), `ledger` (9), `db` (4), `sim` (3) paketleri **gerçek PostgreSQL**'e karşı çalışır (testler başına izole veritabanı) |
-| `make verify` | 15 kimlik, **15/15 PASS** (seed edilmiş tam veride ≈3 sn) |
+| Go testleri | **129 test**, hepsi geçiyor; `api` (80), `ledger` (9), `db` (4), `sim` (3) paketleri **gerçek PostgreSQL**'e karşı çalışır (testler başına izole veritabanı) |
+| `make verify` | 16 kimlik, **16/16 PASS** (seed edilmiş tam veride ≈3 sn) |
 | CI (GitHub Actions) | `lint` (golangci-lint) + `test` (PostgreSQL servisiyle) + `docker` (imaj derlemesi), hepsi yeşil |
 | Arayüz | Başsız Firefox ile uçtan uca senaryo (`tests/ui`), **gerçek nginx ve gerçek CSP altında 20/20** adım geçti (Swagger sayfası dahil; +1 isteğe bağlı "sunucu kapalı" adımı, `UI_DOCKER=1`) |
 | k6 yük testi | 20 eşzamanlı kullanıcı, 20 sn: **5.511 fatura**, 0 hata, p95 = 161 ms; numaralar **1..5511 boşluksuz ve çiftsiz** (test kendisi doğrular) |
@@ -343,7 +346,7 @@ dengesiz yevmiye kaydı sayısı: 0          (103.859 kayıt, 244.417 satır)
 **(c) Eşzamanlı karışık iş yükünde değişmez** (`TestBooksStayBalancedAfterConcurrentMixedWorkload`): 30 eşzamanlı alış/satış faturası + 15 eşzamanlı iptal sonrası mizan dengeli, `sum(debit)-sum(credit)=0`, dengesiz kayıt 0, tam 15 ters kayıt.
 
 ```bash
-docker compose --profile test run --rm test      # 121 test, gerçek PostgreSQL ile
+docker compose --profile test run --rm test      # 129 test, gerçek PostgreSQL ile
 ```
 Kuralın uygulamayla değil **veritabanıyla** zorlandığının kanıtı: `TestDatabaseRejectsUnbalancedEntryEvenViaRawSQL` doğrudan SQL ile dengesiz kayıt yazmayı dener; commit `DD002` ile reddedilir.
 Ters kayıt silme değildir (`journal_lines` UPDATE/DELETE/TRUNCATE reddedilir, `TestJournalIsImmutable`).

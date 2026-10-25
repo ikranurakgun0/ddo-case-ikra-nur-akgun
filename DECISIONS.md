@@ -131,3 +131,19 @@ Kanıt komutları `TESTING.md` içinde görev kimliğiyle listelidir.
 
 **Sonuç.** Aynı tohum = aynı özet; `reset` + `seed` ilk seed ile aynı özeti verir (test). Seed sırasında yalnızca seed oturumunda `synchronous_commit=off` kullanılır (yarım kalırsa zaten baştan sıfırlanır).
 **Bedel:** `reset` için süper kullanıcı yetkisi (`session_replication_role=replica`) gerekir; bu yalnızca demo/geliştirme komutudur, hiçbir HTTP ucundan çağrılamaz.
+
+---
+
+## K-10 · Denetim kaydı: işle aynı transaction'da, eklemeli-yalnız
+
+**Bağlam.** Şartname, kritik işlemlerin (kim, ne zaman, neyi, eski/yeni değer) eklemeli-yalnız bir tabloya yazılmasını ister.
+
+**Seçenekler.**
+1. Veritabanı tetikleyicileriyle otomatik kayıt → "kim" bilgisi (uygulama kullanıcısı) bilinmez; iş anlamı (iptal, düzeltme) çıkarılamaz.
+2. Uygulamada, işlemden sonra ayrı bir istekle yazma → işlem başarılı olup kayıt yazılamayabilir (ya da tersi).
+3. **Uygulamada, işle AYNI transaction'da yazma** (`internal/audit`); tablo tetikleyiciyle eklemeli-yalnız.
+
+**Karar.** Seçenek 3. Alan fonksiyonları (`CreateTx`, `CancelTx`, ödeme oluştur/sil/avans mahsubu), dönem kapatma ve cari/ürün oluşturma kaydı kendi transaction'ı içinde yazar.
+
+**Sonuç.** Başarısız bir işlem (kapalı dönem, yetersiz stok, geçersiz KDV, tekrarlı SKU, dönemin geri açılması) **hiç kayıt bırakmaz**; başarılı bir işlem tam bir kayıt bırakır (`TestFailedOperationsLeaveNoAuditTrail`, `make verify` AUDIT). Kayıt hangi kullanıcının yaptığını (`actor_id`/e-posta) ve eski → yeni değeri taşır. Denetim kayıtlarını silmek/değiştirmek veritabanında reddedilir.
+**Bedel:** her yazma işlemine bir `INSERT` eklenir. Ölçtüm: 6.000 olaylık seed denetimsiz 16,8–18,7 sn, denetimli 16,5–17,3 sn sürdü (≈6.000 ek denetim satırı yazılmasına rağmen fark ölçüm gürültüsü içinde). Yalnızca *kritik* işlemler kaydedilir, okumalar kaydedilmez; tablo zamanla büyür (dizin: `(business_id, id DESC)`).

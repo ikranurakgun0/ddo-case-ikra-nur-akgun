@@ -29,7 +29,7 @@ Parola: **`Demo123!`**. Her işletme (`N` = 1..5) için dört rol vardır:
 make verify                                          # Windows'ta make yoksa:
 docker compose --profile verify run --rm verify
 ```
-Seed bitene kadar bekler. Çıktının sonu 15 satırlık `PASS`/`FAIL` tablosu ve `15/15 geçti` olmalıdır; hata varsa sıfırdan farklı kodla çıkar. Süre ≈ 3-10 sn.
+Seed bitene kadar bekler. Çıktının sonu 16 satırlık `PASS`/`FAIL` tablosu ve `16/16 geçti` olmalıdır; hata varsa sıfırdan farklı kodla çıkar. Süre ≈ 3-10 sn.
 
 | Kimlik | Ne denenir | Elle nasıl denenir / beklenen |
 |---|---|---|
@@ -48,6 +48,7 @@ Seed bitene kadar bekler. Çıktının sonu 15 satırlık `PASS`/`FAIL` tablosu 
 | `T-3` | **Tahsilat mahsubu:** FIFO, avans, silince geri alma, yaşlandırma kovaları (30/31/60/61/90/91 gün sınırları), 15 eşzamanlı tahsilat | aşağıda "T-3 kanıtı" |
 | `T-4` | **Ağırlıklı ortalama maliyet:** geçmişe dönük alışla yeniden hesap, düzeltme, yetersiz stok, 15 eşzamanlı satış | aşağıda "T-4 kanıtı" |
 | `IDEMPOTENCY` | `Idempotency-Key`: tekrar istek aynı sonuç; 8 eşzamanlı istek tek ödeme | `requests.http` → aynı anahtarla iki kez gönder |
+| `AUDIT` | **Denetim kaydı:** fatura/ödeme/cari işlemleri kim, ne zaman, neyi, eski→yeni değerle yazılır; başarısız işlem iz bırakmaz; yalnızca sahip/muhasebeci okur | bir faturayı kes + iptal et → detayda **"Denetim izi"**; ya da `GET /audit-log?entity=invoice&entity_id=<id>` |
 
 ## 3. Kanıt komutları (zorlu görev kimliğiyle)
 
@@ -59,6 +60,7 @@ make test                                  # ya da: docker compose --profile tes
 
 | Görev | Kanıtı üreten komut | Beklenen |
 |---|---|---|
+| **Denetim** | `TestInvoiceLifecycleIsAudited`, `TestPaymentLifecycleIsAudited`, `TestPeriodCloseAndSettingsAreAudited`, `TestFailedOperationsLeaveNoAuditTrail`, `TestAuditLogRemainsAppendOnlyAfterNewWrites` | `ok` |
 | **T-1** | `make test` içindeki `TestBooksStayBalancedAfterConcurrentMixedWorkload`, `TestDatabaseRejectsUnbalancedEntryEvenViaRawSQL`, `TestJournalIsImmutable`, `TestClosedPeriodBlocksPostingAndCannotReopen` | hepsi `ok` |
 | | SQL denetimi: `docker compose exec db psql -U esnaf -d esnafdefter -c "SELECT sum(debit)-sum(credit) AS fark FROM journal_lines;"` | `fark = 0` |
 | **T-2** | `TestInvoiceNumbersAreGapFreeUnderConcurrency`, `TestFailedInvoiceDoesNotConsumeNumber`, `TestInvariantsRandomized` (20.000 rastgele fatura) | `ok` |
@@ -74,7 +76,7 @@ docker compose --profile test run --rm test sh -c "go test ./internal/api/ -run 
 ## 4. Arayüzde elle gezme senaryoları (≈10 dk)
 
 1. `http://localhost:3000` → **"İşletme sahibi"** demo girişi → **Pano**: 6 gösterge, "Canlı" göstergesi; ~10 sn içinde "Son faturalar" yeni kayıtla (yeşil vurgu) güncellenir.
-2. **Faturalar:** yeniden eskiye; "Satış/Alış" ve "Geçerli/İptal" süzgeçleri; bir satıra tıkla → kalemler, KDV, toplamlar; "Yevmiye kayıtları" (borç=alacak).
+2. **Faturalar:** yeniden eskiye; "Satış/Alış" ve "Geçerli/İptal" süzgeçleri; bir satıra tıkla → kalemler, KDV, toplamlar; "Yevmiye kayıtları" (borç=alacak); **"Denetim izi"** (kim/ne zaman/ne yaptı, eski→yeni değer).
 3. **+ Yeni fatura:** cari ara (örn. "Yıldız"), kalem gir (örn. miktar `2,5`, birim fiyat `1.250,50`), "KDV dahil" kutusunu dene, kes → detay penceresi açılır. Boş bırakıp kesmeyi dene → Türkçe doğrulama hatası.
 4. Aynı faturayı **iptal et** → durum "İptal", yevmiye kayıtlarında ters kayıt görünür; **Raporlar → Mizan** hâlâ "dengeli".
 5. **Tahsilat / Ödeme → + Tahsilat al:** bir cari seç, tutar gir → "En eski faturadan başlayarak mahsup edildi" tablosu; fazlası "avans".
