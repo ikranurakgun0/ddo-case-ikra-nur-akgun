@@ -1,0 +1,526 @@
+openapi: 3.0.3
+info:
+  title: EsnafDefter API
+  version: 1.0.0
+  description: |
+    Küçük işletmeler için çift kayıt muhasebe, cari, fatura, tahsilat ve stok API'si.
+
+    **Kurallar**
+    - Tüm tutarlar **kuruş cinsinden tam sayıdır** (`10050` = 100,50 ₺). Miktarlar metin olarak gönderilir (`"2.5"`, en fazla 3 ondalık).
+    - Hata biçimi her yerde aynıdır: `{"error":{"code":"...","message":"..."}}`.
+    - Büyük listelerde **keyset sayfalama**: yanıttaki `next_after` değeri bir sonraki isteğe `after` olarak verilir (opak imleç).
+    - Durum değiştiren kritik `POST` istekleri (fatura, tahsilat/ödeme, fatura düzeltme) `Idempotency-Key` başlığını destekler:
+      aynı anahtar + aynı istek → aynı yanıt (`Idempotent-Replay: true`); aynı anahtar + farklı istek → `422`.
+    - Yetkilendirme: `Authorization: Bearer <access_token>`. Roller: `owner`, `accountant`, `employee`, `customer`.
+      Yetkisiz erişim `401`, yetersiz rol `403`, başka işletmenin verisi `404`.
+    - Demo hesaplar: `owner|accountant|employee|customer@isletmeN.demo` (N=1..5), parola `Demo123!`.
+servers:
+  - url: /api
+    description: Frontend (nginx) üzerinden
+  - url: http://localhost:8080
+    description: Doğrudan API
+tags:
+  - name: Sağlık
+  - name: Kimlik
+  - name: Cariler
+  - name: Ürünler ve stok
+  - name: Faturalar
+  - name: Tahsilat ve ödeme
+  - name: Muhasebe ve raporlar
+  - name: Ayarlar
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    After:
+      name: after
+      in: query
+      description: Önceki sayfanın `next_after` değeri (opak imleç)
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 200 }
+      description: Aynı anahtarla tekrar gelen aynı istek yeni kayıt üretmez, ilk yanıtı döndürür.
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: Hata
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: validation_error }
+            message: { type: string }
+    Tokens:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, example: 900 }
+        role: { type: string, enum: [owner, accountant, employee, customer] }
+    Contact:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [customer, supplier, both] }
+        name: { type: string }
+        tax_no: { type: string }
+        email: { type: string }
+        phone: { type: string }
+    Product:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        name: { type: string }
+        kind: { type: string, enum: [product, service] }
+        unit: { type: string }
+        vat_rate: { type: integer, enum: [1, 10, 20] }
+        sale_price: { type: integer, description: kuruş }
+        stock:
+          type: object
+          description: Yalnızca `product` türünde
+          properties:
+            quantity_milli: { type: integer, description: binde bir birim (1000 = 1 adet) }
+            value: { type: integer, description: kuruş }
+            avg_unit_cost: { type: integer, description: kuruş }
+    InvoiceLineInput:
+      type: object
+      required: [description, quantity, unit_price, vat_rate]
+      properties:
+        product_id: { type: string, format: uuid, description: Stok takipli üründe stok hareketi üretir }
+        description: { type: string }
+        quantity: { type: string, example: "2.5", description: en fazla 3 ondalık }
+        unit_price: { type: integer, description: kuruş; `prices_include_vat` true ise KDV dahil }
+        vat_rate: { type: integer, enum: [1, 10, 20] }
+        discount: { type: integer, description: satır iskontosu (kuruş) }
+    InvoiceInput:
+      type: object
+      required: [kind, contact_id, issue_date, due_date, lines]
+      properties:
+        kind: { type: string, enum: [sale, purchase] }
+        contact_id: { type: string, format: uuid }
+        series: { type: string, description: "Boşsa satış için A, alış için AL. [A-Z0-9]{1,8}" }
+        issue_date: { type: string, format: date }
+        due_date: { type: string, format: date }
+        prices_include_vat: { type: boolean }
+        general_discount: { type: integer, description: kuruş; satırlara orantılı dağıtılır }
+        lines: { type: array, items: { $ref: '#/components/schemas/InvoiceLineInput' } }
+    InvoiceLine:
+      type: object
+      properties:
+        line_no: { type: integer }
+        product_id: { type: string }
+        description: { type: string }
+        quantity_milli: { type: integer }
+        unit_price: { type: integer }
+        vat_rate: { type: integer }
+        discount: { type: integer }
+        allocated_discount: { type: integer }
+        net: { type: integer }
+        vat: { type: integer }
+        gross: { type: integer }
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [sale, purchase] }
+        number: { type: string, example: A-2026-000001 }
+        series: { type: string }
+        year: { type: integer }
+        seq: { type: integer }
+        contact_id: { type: string }
+        contact_name: { type: string }
+        issue_date: { type: string, format: date }
+        due_date: { type: string, format: date }
+        status: { type: string, enum: [issued, cancelled] }
+        prices_include_vat: { type: boolean }
+        general_discount: { type: integer }
+        net_total: { type: integer }
+        vat_total: { type: integer }
+        gross_total: { type: integer }
+        created_at: { type: string, format: date-time }
+        paid: { type: integer, description: mahsup edilen tutar }
+        open: { type: integer, description: kalan tutar (iptalde 0) }
+        lines: { type: array, items: { $ref: '#/components/schemas/InvoiceLine' } }
+    PaymentInput:
+      type: object
+      required: [kind, contact_id, method, date, amount]
+      properties:
+        kind: { type: string, enum: [receipt, disbursement], description: tahsilat / ödeme }
+        contact_id: { type: string, format: uuid }
+        method: { type: string, enum: [cash, bank] }
+        date: { type: string, format: date }
+        amount: { type: integer, description: kuruş, minimum: 1 }
+    Allocation:
+      type: object
+      properties:
+        invoice_id: { type: string }
+        invoice_number: { type: string }
+        amount: { type: integer }
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        contact_id: { type: string }
+        contact_name: { type: string }
+        method: { type: string }
+        date: { type: string, format: date }
+        amount: { type: integer }
+        status: { type: string, enum: [active, deleted] }
+        created_at: { type: string, format: date-time }
+        allocated: { type: integer }
+        advance: { type: integer, description: mahsup edilmeyen (avans) kısım }
+        allocations: { type: array, items: { $ref: '#/components/schemas/Allocation' } }
+    Page:
+      type: object
+      properties:
+        next_after: { type: string, nullable: true }
+paths:
+  /health:
+    get:
+      tags: [Sağlık]
+      summary: Sağlık durumu (veritabanı bağlantısı dahil)
+      security: []
+      responses:
+        '200': { description: Sağlıklı, content: { application/json: { schema: { type: object, properties: { status: { type: string }, db: { type: string } } } } } }
+        '503': { description: Veritabanına ulaşılamıyor }
+  /auth/login:
+    post:
+      tags: [Kimlik]
+      summary: Giriş
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [email, password], properties: { email: { type: string }, password: { type: string } } } } }
+      responses:
+        '200': { description: Belirteçler, content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/refresh:
+    post:
+      tags: [Kimlik]
+      summary: Belirteç yenile (rotasyon; iptal edilmiş belirtecin yeniden kullanımı tüm oturumları kapatır)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [refresh_token], properties: { refresh_token: { type: string } } } } }
+      responses:
+        '200': { description: Yeni belirteçler, content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/logout:
+    post:
+      tags: [Kimlik]
+      summary: Çıkış (yenileme belirtecini iptal eder)
+      security: []
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { refresh_token: { type: string } } } } }
+      responses:
+        '204': { description: Tamam }
+  /me:
+    get:
+      tags: [Kimlik]
+      summary: Oturumdaki kullanıcı
+      responses:
+        '200': { description: Kullanıcı }
+        '401': { $ref: '#/components/responses/Error' }
+  /me/statement:
+    get:
+      tags: [Kimlik]
+      summary: Müşteri rolünün kendi carisinin salt okunur ekstresi
+      description: Yalnızca `customer` rolü.
+      responses:
+        '200': { description: Ekstre }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /dashboard:
+    get:
+      tags: [Muhasebe ve raporlar]
+      summary: Pano özeti (açık alacak/borç, kasa+banka, stok değeri, aylık satış/KDV, son hareketler)
+      description: Roller owner, accountant, employee.
+      responses:
+        '200': { description: Özet }
+  /contacts:
+    get:
+      tags: [Cariler]
+      summary: Cari listesi (ada göre sıralı, keyset sayfalama)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/After'
+        - { name: q, in: query, schema: { type: string }, description: Ad içinde arama }
+        - { name: kind, in: query, schema: { type: string, enum: [customer, supplier, both] }, description: customer = müşteri + both }
+      responses:
+        '200': { description: Sayfa, content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Page' }, { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Contact' } } } }] } } } }
+    post:
+      tags: [Cariler]
+      summary: Cari oluştur
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [kind, name], properties: { kind: { type: string, enum: [customer, supplier, both] }, name: { type: string }, tax_no: { type: string }, email: { type: string }, phone: { type: string } } } } }
+      responses:
+        '201': { description: Oluşturuldu, content: { application/json: { schema: { $ref: '#/components/schemas/Contact' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /contacts/{id}:
+    get:
+      tags: [Cariler]
+      summary: Cari getir
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Cari, content: { application/json: { schema: { $ref: '#/components/schemas/Contact' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /contacts/{id}/statement:
+    get:
+      tags: [Cariler]
+      summary: Cari ekstresi (yürüyen bakiye)
+      description: Roller owner, accountant.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - { name: kind, in: query, schema: { type: string, enum: [receivable, payable], default: receivable } }
+      responses:
+        '200': { description: Ekstre }
+  /products:
+    get:
+      tags: [Ürünler ve stok]
+      summary: Ürün/hizmet listesi (SKU'ya göre sıralı)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/After'
+        - { name: q, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, enum: [product, service] } }
+      responses:
+        '200': { description: Sayfa }
+    post:
+      tags: [Ürünler ve stok]
+      summary: Ürün veya hizmet kartı oluştur
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [sku, name, kind, vat_rate], properties: { sku: { type: string }, name: { type: string }, kind: { type: string, enum: [product, service] }, unit: { type: string }, vat_rate: { type: integer, enum: [1, 10, 20] }, sale_price: { type: integer } } } } }
+      responses:
+        '201': { description: Oluşturuldu, content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { description: Tekrarlı SKU (duplicate_sku), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /products/{id}:
+    get:
+      tags: [Ürünler ve stok]
+      summary: Ürün kartı ve stok durumu
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Ürün, content: { application/json: { schema: { $ref: '#/components/schemas/Product' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /stock-movements:
+    get:
+      tags: [Ürünler ve stok]
+      summary: Stok hareketleri
+      parameters:
+        - { name: product_id, in: query, schema: { type: string, format: uuid } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
+        - $ref: '#/components/parameters/Limit'
+        - { name: after, in: query, schema: { type: integer }, description: Son görülen hareket id'si }
+      responses:
+        '200': { description: Sayfa }
+  /reports/stock:
+    get:
+      tags: [Ürünler ve stok]
+      summary: Stok raporu (ürün bazında miktar, değer, ortalama maliyet)
+      responses:
+        '200': { description: Rapor }
+  /invoices:
+    get:
+      tags: [Faturalar]
+      summary: Fatura listesi (yeniden eskiye, keyset sayfalama)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/After'
+        - { name: series, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, enum: [sale, purchase] } }
+        - { name: status, in: query, schema: { type: string, enum: [issued, cancelled] } }
+        - { name: contact_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Sayfa, content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Page' }, { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Invoice' } } } }] } } } }
+    post:
+      tags: [Faturalar]
+      summary: Fatura kes
+      description: |
+        Tek transaction içinde fatura, satırlar, stok hareketleri ve yevmiye kaydı yazılır; hata olursa hiçbiri kalmaz ve fatura numarası da geri döner (boşluk oluşmaz).
+        Numara `SERİ-YIL-SIRA` biçimindedir (örn. `A-2026-000042`).
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/InvoiceInput' } } }
+      responses:
+        '201': { description: Oluşturuldu, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '400': { description: "Doğrulama hatası (validation_error, invalid_vat_rate, discount_exceeds_total, contact_kind_mismatch...)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: Cari veya ürün bulunamadı }
+        '409': { description: "period_closed (kapalı dönem) ya da insufficient_stock (yetersiz stok)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: idempotency_key_reused }
+  /invoices/{id}:
+    get:
+      tags: [Faturalar]
+      summary: Fatura getir
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Fatura, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /invoices/{id}/cancel:
+    post:
+      tags: [Faturalar]
+      summary: Faturayı iptal et (ters kayıt; silinmez)
+      description: Roller owner, accountant. Mahsup edilmiş fatura iptal edilemez (`has_payments`).
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { date: { type: string, format: date, description: Ters kaydın tarihi; boşsa bugün } } } } }
+      responses:
+        '200': { description: İptal edilen fatura, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '409': { description: "already_cancelled, period_closed, has_payments veya insufficient_stock" }
+  /invoices/{id}/correct:
+    post:
+      tags: [Faturalar]
+      summary: Alış faturasını düzelt (eski iptal + yenisi); sonraki çıkışların maliyeti yeniden hesaplanır
+      description: Roller owner, accountant. Yalnızca alış faturaları. `cancel_date` eski faturanın ters kayıt tarihidir.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/InvoiceInput' } } }
+      responses:
+        '201': { description: Yeni fatura, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /invoices/{id}/journal:
+    get:
+      tags: [Faturalar]
+      summary: Faturanın yevmiye kayıtları (ters kayıt dahil)
+      description: Roller owner, accountant.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Kayıtlar }
+  /payments:
+    get:
+      tags: [Tahsilat ve ödeme]
+      summary: Ödeme listesi (yeniden eskiye)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/After'
+        - { name: kind, in: query, schema: { type: string, enum: [receipt, disbursement] } }
+        - { name: contact_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Sayfa }
+    post:
+      tags: [Tahsilat ve ödeme]
+      summary: Tahsilat/ödeme kaydet
+      description: |
+        Tutar, caridenin açık faturalarına **en eskiden başlayarak (FIFO)** mahsup edilir. Fazlası avans olarak tutulur (340 / 159).
+        Aynı carinin eşzamanlı ödemeleri cari kilidiyle sıralanır; hiçbir fatura fazla kapatılamaz.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PaymentInput' } } }
+      responses:
+        '201': { description: Kaydedildi, content: { application/json: { schema: { $ref: '#/components/schemas/Payment' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { description: period_closed }
+  /payments/{id}:
+    get:
+      tags: [Tahsilat ve ödeme]
+      summary: Ödeme ve mahsupları
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Ödeme, content: { application/json: { schema: { $ref: '#/components/schemas/Payment' } } } }
+    delete:
+      tags: [Tahsilat ve ödeme]
+      summary: Ödemeyi sil (mahsuplar geri alınır, yevmiye ters kayıtla kapanır)
+      description: Roller owner, accountant. `?date=` ters kaydın tarihi.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - { name: date, in: query, schema: { type: string, format: date } }
+      responses:
+        '200': { description: Silinen ödeme, content: { application/json: { schema: { $ref: '#/components/schemas/Payment' } } } }
+        '409': { description: already_deleted veya period_closed }
+  /payments/{id}/apply-advance:
+    post:
+      tags: [Tahsilat ve ödeme]
+      summary: Avansı sonradan kesilen açık faturalara mahsup et
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Güncel ödeme, content: { application/json: { schema: { $ref: '#/components/schemas/Payment' } } } }
+        '409': { description: no_advance }
+  /reports/trial-balance:
+    get:
+      tags: [Muhasebe ve raporlar]
+      summary: Mizan (toplam borç = toplam alacak)
+      parameters: [{ name: as_of, in: query, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: Mizan }
+  /reports/vat-summary:
+    get:
+      tags: [Muhasebe ve raporlar]
+      summary: KDV özeti (iptal edilen faturalar hariç)
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        '200': { description: "Özet (output_vat, input_vat, payable)" }
+  /reports/aging:
+    get:
+      tags: [Muhasebe ve raporlar]
+      summary: Vade yaşlandırma (0-30 / 31-60 / 61-90 / 90+)
+      description: Gün = rapor tarihi − vade tarihi. Vadesi gelmemiş alacaklar 0-30 kovasındadır.
+      parameters:
+        - { name: kind, in: query, schema: { type: string, enum: [receivable, payable], default: receivable } }
+        - { name: as_of, in: query, schema: { type: string, format: date } }
+        - { name: detail, in: query, schema: { type: string, enum: ['1'] }, description: fatura satırlarını da döndürür }
+      responses:
+        '200': { description: Rapor }
+  /periods:
+    get:
+      tags: [Muhasebe ve raporlar]
+      summary: Kapatılmış dönem bilgisi
+      responses:
+        '200': { description: closed_through }
+  /periods/close:
+    post:
+      tags: [Muhasebe ve raporlar]
+      summary: Dönemi kapat (yalnızca ileri gider; geri açılamaz)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [through], properties: { through: { type: string, format: date } } } } }
+      responses:
+        '200': { description: Kapatıldı }
+        '409': { description: period_not_advancing }
+  /settings:
+    get:
+      tags: [Ayarlar]
+      summary: İşletme ayarları (yalnızca owner)
+      responses:
+        '200': { description: Ayarlar }
+    put:
+      tags: [Ayarlar]
+      summary: Negatif stok politikasını değiştir (yalnızca owner; denetim kaydına yazılır)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { allow_negative_stock: { type: boolean } } } } }
+      responses:
+        '200': { description: Güncellendi }
