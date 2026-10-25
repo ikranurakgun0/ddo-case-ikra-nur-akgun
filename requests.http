@@ -1,0 +1,291 @@
+### EsnafDefter elle deneme koleksiyonu (VS Code "REST Client" eklentisi: humao.rest-client)
+### Önce sistemi başlatın: docker compose up --build   (seed arka planda sürer; bitince veri tamdır)
+### Demo hesaplar (her işletme için): owner@isletmeN.demo, accountant@..., employee@..., customer@...  parola: Demo123!
+### N = 1..5. Canlı olay akışı 1-4. işletmelere yazar; 5. işletme doğrulama (make verify) içindir.
+
+@host = http://localhost:8080
+@tarih = 2026-10-25
+
+### ---------- Sağlık ----------
+GET {{host}}/health
+
+### ---------- Kimlik doğrulama ----------
+# @name login
+POST {{host}}/auth/login
+Content-Type: application/json
+
+{ "email": "owner@isletme1.demo", "password": "Demo123!" }
+
+###
+@token = {{login.response.body.access_token}}
+@refresh = {{login.response.body.refresh_token}}
+
+### Yanlış parola -> 401
+POST {{host}}/auth/login
+Content-Type: application/json
+
+{ "email": "owner@isletme1.demo", "password": "yanlis" }
+
+### Kim olduğumu göster
+GET {{host}}/me
+Authorization: Bearer {{token}}
+
+### Belirteç yenile (eski belirteç iptal olur; tekrar kullanılırsa tüm oturumlar kapanır)
+POST {{host}}/auth/refresh
+Content-Type: application/json
+
+{ "refresh_token": "{{refresh}}" }
+
+### Çıkış
+POST {{host}}/auth/logout
+Content-Type: application/json
+
+{ "refresh_token": "{{refresh}}" }
+
+### ---------- Cariler (F-1) ----------
+# @name yeniMusteri
+POST {{host}}/contacts
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "kind": "customer", "name": "Deneme Müşteri A.Ş.", "tax_no": "1234567890" }
+
+###
+@musteri = {{yeniMusteri.response.body.id}}
+
+# @name yeniTedarikci
+POST {{host}}/contacts
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "kind": "supplier", "name": "Deneme Tedarikçi Ltd." }
+
+###
+@tedarikci = {{yeniTedarikci.response.body.id}}
+
+### Listele (keyset sayfalama: next_after değerini after olarak verin)
+GET {{host}}/contacts?limit=5
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/contacts/{{musteri}}
+Authorization: Bearer {{token}}
+
+### ---------- Ürün ve hizmet kartları (F-2) ----------
+# @name yeniUrun
+POST {{host}}/products
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "sku": "DENEME-001", "name": "Deneme Ürünü", "kind": "product", "vat_rate": 20, "sale_price": 25000 }
+
+###
+@urun = {{yeniUrun.response.body.id}}
+
+### Hizmet kartı (stok tutulmaz)
+POST {{host}}/products
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "sku": "HIZMET-001", "name": "Montaj hizmeti", "kind": "service", "vat_rate": 10, "sale_price": 50000 }
+
+###
+GET {{host}}/products?limit=5
+Authorization: Bearer {{token}}
+
+### ---------- Faturalar (F-3, T-2) ----------
+# Tutarlar KURUŞ cinsinden tam sayıdır (10000 = 100,00 TL). Miktar en fazla 3 ondalık basamaktır.
+
+### Alış faturası: stok girişi (10 adet x 100,00 TL, KDV hariç %20)
+# @name alis
+POST {{host}}/invoices
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "kind": "purchase", "contact_id": "{{tedarikci}}", "issue_date": "{{tarih}}", "due_date": "2026-11-25",
+  "lines": [ { "product_id": "{{urun}}", "description": "Deneme Ürünü", "quantity": "10", "unit_price": 10000, "vat_rate": 20 } ]
+}
+
+###
+@alisFatura = {{alis.response.body.id}}
+
+### Satış faturası: 2,5 adet, KDV DAHİL fiyat, satır iskontosu + genel iskonto
+# @name satis
+POST {{host}}/invoices
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: deneme-satis-1
+
+{
+  "kind": "sale", "contact_id": "{{musteri}}", "issue_date": "{{tarih}}", "due_date": "2026-11-25",
+  "prices_include_vat": true, "general_discount": 500,
+  "lines": [
+    { "product_id": "{{urun}}", "description": "Deneme Ürünü", "quantity": "2.5", "unit_price": 25000, "vat_rate": 20, "discount": 1000 },
+    { "description": "Nakliye", "quantity": "1", "unit_price": 1999, "vat_rate": 20 }
+  ]
+}
+
+###
+@satisFatura = {{satis.response.body.id}}
+
+### Aynı Idempotency-Key ile tekrar -> aynı fatura döner (Idempotent-Replay: true), yeni fatura oluşmaz
+POST {{host}}/invoices
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: deneme-satis-1
+
+{
+  "kind": "sale", "contact_id": "{{musteri}}", "issue_date": "{{tarih}}", "due_date": "2026-11-25",
+  "prices_include_vat": true, "general_discount": 500,
+  "lines": [
+    { "product_id": "{{urun}}", "description": "Deneme Ürünü", "quantity": "2.5", "unit_price": 25000, "vat_rate": 20, "discount": 1000 },
+    { "description": "Nakliye", "quantity": "1", "unit_price": 1999, "vat_rate": 20 }
+  ]
+}
+
+###
+GET {{host}}/invoices/{{satisFatura}}
+Authorization: Bearer {{token}}
+
+### Fatura listesi (series= ile seriye göre filtrelenebilir)
+GET {{host}}/invoices?limit=5
+Authorization: Bearer {{token}}
+
+### Faturanın yevmiye kayıtları (T-1)
+GET {{host}}/invoices/{{satisFatura}}/journal
+Authorization: Bearer {{token}}
+
+### Geçersiz KDV oranı -> 400 invalid_vat_rate
+POST {{host}}/invoices
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "kind": "sale", "contact_id": "{{musteri}}", "issue_date": "{{tarih}}", "due_date": "{{tarih}}",
+  "lines": [ { "description": "x", "quantity": "1", "unit_price": 100, "vat_rate": 18 } ] }
+
+### ---------- Tahsilat ve ödeme (F-4, T-3) ----------
+### Tahsilat: açık faturalara en eskiden başlayarak (FIFO) mahsup edilir; fazlası avans olur
+# @name tahsilat
+POST {{host}}/payments
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: deneme-tahsilat-1
+
+{ "kind": "receipt", "contact_id": "{{musteri}}", "method": "bank", "date": "{{tarih}}", "amount": 20000 }
+
+###
+@odeme = {{tahsilat.response.body.id}}
+
+###
+GET {{host}}/payments/{{odeme}}
+Authorization: Bearer {{token}}
+
+### Tedarikçiye ödeme
+POST {{host}}/payments
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "kind": "disbursement", "contact_id": "{{tedarikci}}", "method": "cash", "date": "{{tarih}}", "amount": 50000 }
+
+### Avansı sonradan kesilen faturalara mahsup et
+POST {{host}}/payments/{{odeme}}/apply-advance
+Authorization: Bearer {{token}}
+
+### Tahsilatı sil: mahsuplar geri alınır, faturalar yeniden açılır (muhasebeci/sahip)
+DELETE {{host}}/payments/{{odeme}}
+Authorization: Bearer {{token}}
+
+### ---------- Stok (F-5, T-4) ----------
+GET {{host}}/products/{{urun}}
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/stock-movements?product_id={{urun}}
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/reports/stock
+Authorization: Bearer {{token}}
+
+### Alış faturasını düzelt (eski iptal + yenisi); sonraki çıkışların maliyeti ve SMM yeniden hesaplanır
+POST {{host}}/invoices/{{alisFatura}}/correct
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "kind": "purchase", "contact_id": "{{tedarikci}}", "issue_date": "{{tarih}}", "due_date": "2026-11-25",
+  "lines": [ { "product_id": "{{urun}}", "description": "Deneme Ürünü", "quantity": "10", "unit_price": 12000, "vat_rate": 20 } ]
+}
+
+### Negatif stok politikası (yalnızca sahip)
+GET {{host}}/settings
+Authorization: Bearer {{token}}
+
+###
+PUT {{host}}/settings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "allow_negative_stock": false }
+
+### ---------- Raporlar ve muhasebe (F-6, F-7, T-1, T-3) ----------
+### Mizan (toplam borç = toplam alacak)
+GET {{host}}/reports/trial-balance
+Authorization: Bearer {{token}}
+
+### KDV özeti
+GET {{host}}/reports/vat-summary?from=2026-10-01&to=2026-10-31
+Authorization: Bearer {{token}}
+
+### Vade yaşlandırma (0-30 / 31-60 / 61-90 / 90+); detail=1 fatura satırlarını da verir
+GET {{host}}/reports/aging?as_of={{tarih}}&detail=1
+Authorization: Bearer {{token}}
+
+### Borç yaşlandırma (tedarikçilere)
+GET {{host}}/reports/aging?kind=payable&as_of={{tarih}}
+Authorization: Bearer {{token}}
+
+### Cari ekstresi
+GET {{host}}/contacts/{{musteri}}/statement
+Authorization: Bearer {{token}}
+
+### Kapalı dönem bilgisi
+GET {{host}}/periods
+Authorization: Bearer {{token}}
+
+### Dönem kapat (yalnızca ileri gider, geri açılamaz)
+POST {{host}}/periods/close
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "through": "2026-04-30" }
+
+### Faturayı iptal et (ters kayıt atılır; kapalı döneme ters kayıt yazılamaz)
+POST {{host}}/invoices/{{satisFatura}}/cancel
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "date": "{{tarih}}" }
+
+### ---------- Müşteri rolü: salt okunur ekstre ----------
+# @name musteriGiris
+POST {{host}}/auth/login
+Content-Type: application/json
+
+{ "email": "customer@isletme1.demo", "password": "Demo123!" }
+
+###
+@musteriToken = {{musteriGiris.response.body.access_token}}
+
+###
+GET {{host}}/me/statement
+Authorization: Bearer {{musteriToken}}
+
+### Müşteri fatura kesemez -> 403
+POST {{host}}/invoices
+Authorization: Bearer {{musteriToken}}
+Content-Type: application/json
+
+{ "kind": "sale", "contact_id": "{{musteri}}", "issue_date": "{{tarih}}", "due_date": "{{tarih}}",
+  "lines": [ { "description": "x", "quantity": "1", "unit_price": 100, "vat_rate": 20 } ] }

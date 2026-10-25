@@ -16,6 +16,7 @@ services:
 
   api:
     build: .
+    image: esnafdefter/app:local
     depends_on:
       db:
         condition: service_healthy
@@ -34,7 +35,58 @@ services:
       retries: 20
       start_period: 5s
 
-  # `make test` ile çalışır: gerçek PostgreSQL'e karşı tüm testler.
+  # Veri üretici: önce deterministik seed (aynı tohum = aynı veri), ardından canlı olay akışı.
+  # Seed arka planda sürer; API ve arayüz bu sırada kullanılabilir.
+  simulator:
+    build: .
+    image: esnafdefter/app:local
+    entrypoint: ["/app/simulator"]
+    command: ["run"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+      SIM_SEED: ${SIM_SEED:-42}
+      SIM_BUSINESSES: ${SIM_BUSINESSES:-5}
+      SIM_CONTACTS: ${SIM_CONTACTS:-3000}
+      SIM_EVENTS: ${SIM_EVENTS:-50000}
+      SIM_LIVE_INTERVAL: ${SIM_LIVE_INTERVAL:-5s}
+    restart: on-failure
+
+  # `make verify`: seed bitince tüm özellikleri ve zorlu görevleri uçtan uca dener.
+  verify:
+    profiles: ["verify"]
+    build: .
+    image: esnafdefter/app:local
+    entrypoint: ["/app/verify"]
+    depends_on:
+      api:
+        condition: service_healthy
+      simulator:
+        condition: service_started
+    environment:
+      API_URL: http://api:8080
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+
+  # `make load`: k6 yük testi (fatura numaralandırma ve yazma performansı).
+  k6:
+    profiles: ["load"]
+    image: grafana/k6:0.55.0
+    depends_on:
+      api:
+        condition: service_healthy
+      simulator:
+        condition: service_started
+    environment:
+      API_URL: http://api:8080
+      VUS: ${K6_VUS:-20}
+      DURATION: ${K6_DURATION:-30s}
+    volumes:
+      - ./loadtest:/scripts:ro
+    entrypoint: ["k6", "run", "/scripts/invoices.js"]
+
+  # `make test`: tüm testler, gerçek PostgreSQL'e karşı.
   test:
     profiles: ["test"]
     image: golang:1.23-alpine
