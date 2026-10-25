@@ -32,6 +32,7 @@ const (
 func ValidVATRate(r int) bool { return r == 1 || r == 10 || r == 20 }
 
 type LineInput struct {
+	ProductID     string // isteğe bağlı; stok takipli ürünse stok hareketi üretir
 	Description   string
 	QuantityMilli int64
 	UnitPrice     int64 // kuruş; prices_include_vat ise KDV dahil
@@ -224,3 +225,6 @@ func allDigits(s string) bool {
 	}
 	return true
 }
+
+// NewValidationError diğer paketlerin de aynı istemci hatası türünü üretebilmesi içindir.
+func NewValidationError(code, msg string) error { return &ValidationError{Code: code, Msg: msg} }

@@ -10,11 +10,13 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"esnafdefter/internal/ledger"
+	"esnafdefter/internal/stock"
 )
 
 var (
 	ErrNotFound         = errors.New("fatura bulunamadı")
 	ErrAlreadyCancelled = errors.New("fatura zaten iptal edilmiş")
+	ErrHasPayments      = errors.New("fatura tahsilat/ödeme ile mahsup edilmiş")
 )
 
 var seriesRe = regexp.MustCompile(`^[A-Z0-9]{1,8}$`)
@@ -36,6 +38,7 @@ type CreateParams struct {
 
 type InvoiceLine struct {
 	LineNo            int    `json:"line_no"`
+	ProductID         string `json:"product_id,omitempty"`
 	Description       string `json:"description"`
 	QuantityMilli     int64  `json:"quantity_milli"`
 	UnitPrice         int64  `json:"unit_price"`
@@ -63,6 +66,8 @@ type Invoice struct {
 	NetTotal         int64         `json:"net_total"`
 	VATTotal         int64         `json:"vat_total"`
 	GrossTotal       int64         `json:"gross_total"`
+	Paid             int64         `json:"paid"` // mahsup edilen tutar
+	Open             int64         `json:"open"` // kalan tutar (iptal edilmişse 0)
 	Lines            []InvoiceLine `json:"lines,omitempty"`
 }
 
@@ -70,10 +75,77 @@ func FormatNumber(series string, year int, seq int64) string {
 	return fmt.Sprintf("%s-%d-%06d", series, year, seq)
 }
 
-// CreateTx faturayı, satırlarını ve yevmiye kaydını TEK transaction içinde yazar.
-// Fatura numarası transaction'ın sonuna doğru, kayıtlardan hemen önce alınır; hata olursa
-// transaction geri alınır ve numara da geri döner (boşluk oluşmaz).
-func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) {
+// LockContact carinin satırını kilitler. Tahsilat mahsubu, fatura iptali gibi aynı carinin
+// bakiyesini değiştiren işlemleri sıraya sokar. NO KEY UPDATE: fatura eklemeyi (FK) engellemez.
+func LockContact(ctx context.Context, tx pgx.Tx, businessID, contactID string) error {
+	var one int
+	err := tx.QueryRow(ctx,
+		`SELECT 1 FROM contacts WHERE id = $1::uuid AND business_id = $2::uuid FOR NO KEY UPDATE`, contactID, businessID).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return verr("contact_not_found", "cari bulunamadı")
+	}
+	return err
+}
+
+// CreateAndFinalize faturayı oluşturur ve stok maliyetlerini aynı transaction içinde kesinleştirir.
+func CreateAndFinalize(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) {
+	touched := stock.Set{}
+	inv, err := CreateTx(ctx, tx, p, touched)
+	if err != nil {
+		return nil, err
+	}
+	if err := stock.Finalize(ctx, tx, p.BusinessID, p.UserID, touched, p.IssueDate); err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// CancelAndFinalize faturayı iptal eder ve stok maliyetlerini kesinleştirir.
+func CancelAndFinalize(ctx context.Context, tx pgx.Tx, businessID, userID, invoiceID string, date time.Time) error {
+	touched := stock.Set{}
+	if err := CancelTx(ctx, tx, businessID, userID, invoiceID, date, touched); err != nil {
+		return err
+	}
+	return stock.Finalize(ctx, tx, businessID, userID, touched, date)
+}
+
+// CorrectAndFinalize bir ALIŞ faturasını düzeltir: eski fatura iptal edilir (ters kayıt), yenisi
+// kesilir. Geçmişe dönük alış değiştiği için sonraki tüm çıkışların maliyeti ve SMM kayıtları,
+// ara durumda stok eksiye düşse bile işlem sonunda tek seferde yeniden hesaplanır.
+func CorrectAndFinalize(ctx context.Context, tx pgx.Tx, originalID string, p CreateParams, cancelDate time.Time) (*Invoice, error) {
+	var kind, contact string
+	err := tx.QueryRow(ctx, `SELECT kind, contact_id::text FROM invoices WHERE id = $1::uuid AND business_id = $2::uuid`,
+		originalID, p.BusinessID).Scan(&kind, &contact)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if kind != "purchase" || p.Kind != "purchase" {
+		return nil, verr("not_correctable", "yalnızca alış faturaları düzeltilebilir")
+	}
+	if contact != p.ContactID {
+		return nil, verr("contact_mismatch", "düzeltme aynı cariye ait olmalı")
+	}
+	touched := stock.Set{}
+	if err := CancelTx(ctx, tx, p.BusinessID, p.UserID, originalID, cancelDate, touched); err != nil {
+		return nil, err
+	}
+	inv, err := CreateTx(ctx, tx, p, touched)
+	if err != nil {
+		return nil, err
+	}
+	if err := stock.Finalize(ctx, tx, p.BusinessID, p.UserID, touched, cancelDate); err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// CreateTx faturayı, satırlarını, stok hareketlerini ve yevmiye kaydını TEK transaction içinde yazar.
+// Fatura numarası kayıtlardan hemen önce alınır; hata olursa transaction geri alınır ve numara
+// da geri döner (boşluk oluşmaz). Stok maliyetleri çağıranın stock.Finalize çağrısıyla kesinleşir.
+func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams, touched stock.Set) (*Invoice, error) {
 	if p.Kind != "sale" && p.Kind != "purchase" {
 		return nil, verr("validation_error", "kind 'sale' veya 'purchase' olmalı")
 	}
@@ -111,6 +183,34 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) 
 		return nil, verr("contact_kind_mismatch", "cari türü bu fatura türüne uygun değil")
 	}
 
+	// Ürünleri doğrula ve kilitle (id sırasıyla; sayaçtan ÖNCE, sayaç kilidi kısa kalsın).
+	seen := map[string]bool{}
+	var pids []string
+	for i, l := range p.Lines {
+		if l.ProductID == "" {
+			continue
+		}
+		if !uuidRe.MatchString(l.ProductID) {
+			return nil, verr("product_not_found", "satır %d: ürün bulunamadı", i+1)
+		}
+		if !seen[l.ProductID] {
+			seen[l.ProductID] = true
+			pids = append(pids, l.ProductID)
+		}
+	}
+	kinds, err := stock.LockProducts(ctx, tx, p.BusinessID, pids)
+	if err != nil {
+		return nil, err
+	}
+	for i, l := range p.Lines {
+		if l.ProductID == "" {
+			continue
+		}
+		if _, ok := kinds[l.ProductID]; !ok {
+			return nil, verr("product_not_found", "satır %d: ürün bulunamadı", i+1)
+		}
+	}
+
 	year := p.IssueDate.Year()
 	var seq int64
 	// Satır kilidi transaction sonuna kadar tutulur: aynı seri/yıl için faturalar sıraya girer.
@@ -126,7 +226,7 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) 
 		Kind: p.Kind, Series: p.Series, Year: year, Seq: seq, Number: FormatNumber(p.Series, year, seq),
 		ContactID: p.ContactID, IssueDate: p.IssueDate.Format(dateLayout), DueDate: p.DueDate.Format(dateLayout),
 		Status: "issued", PricesIncludeVAT: p.IncludesVAT, GeneralDiscount: p.GeneralDiscount,
-		NetTotal: res.Net, VATTotal: res.VAT, GrossTotal: res.Gross,
+		NetTotal: res.Net, VATTotal: res.VAT, GrossTotal: res.Gross, Open: res.Gross,
 	}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO invoices(business_id, kind, contact_id, series, year, number, issue_date, due_date,
@@ -137,20 +237,35 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) 
 	if err != nil {
 		return nil, err
 	}
+
+	var stockNet, otherNet int64 // alış yevmiyesinde 153 (stok) ve 770 (diğer) ayrımı için
 	for i, l := range res.Lines {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO invoice_lines(invoice_id, business_id, line_no, description, quantity_milli, unit_price,
+			`INSERT INTO invoice_lines(invoice_id, business_id, line_no, product_id, description, quantity_milli, unit_price,
 			                           vat_rate, line_discount, allocated_discount, net_amount, vat_amount, gross_amount)
-			 VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-			inv.ID, p.BusinessID, i+1, l.Description, l.QuantityMilli, l.UnitPrice, l.VATRate, l.Discount,
+			 VALUES ($1::uuid,$2::uuid,$3,NULLIF($4,'')::uuid,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			inv.ID, p.BusinessID, i+1, l.ProductID, l.Description, l.QuantityMilli, l.UnitPrice, l.VATRate, l.Discount,
 			l.AllocatedDiscount, l.Net, l.VAT, l.Gross); err != nil {
 			return nil, err
 		}
 		inv.Lines = append(inv.Lines, InvoiceLine{
-			LineNo: i + 1, Description: l.Description, QuantityMilli: l.QuantityMilli, UnitPrice: l.UnitPrice,
-			VATRate: l.VATRate, Discount: l.Discount, AllocatedDiscount: l.AllocatedDiscount,
+			LineNo: i + 1, ProductID: l.ProductID, Description: l.Description, QuantityMilli: l.QuantityMilli,
+			UnitPrice: l.UnitPrice, VATRate: l.VATRate, Discount: l.Discount, AllocatedDiscount: l.AllocatedDiscount,
 			Net: l.Net, VAT: l.VAT, Gross: l.Gross,
 		})
+		if l.ProductID != "" && kinds[l.ProductID] == "product" {
+			dir, value := "out", int64(0)
+			if p.Kind == "purchase" {
+				dir, value = "in", l.Net
+				stockNet += l.Net
+			}
+			if err := stock.InsertMovement(ctx, tx, p.BusinessID, l.ProductID, dir, p.IssueDate, l.QuantityMilli, value, inv.ID, i+1); err != nil {
+				return nil, err
+			}
+			touched.Add(l.ProductID)
+		} else {
+			otherNet += l.Net
+		}
 	}
 
 	entry := ledger.Entry{
@@ -164,7 +279,13 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) 
 		}
 	} else {
 		entry.Description = "Alış faturası " + inv.Number
-		entry.Lines = []ledger.Line{{Account: "153", Debit: res.Net}, {Account: "320", Credit: res.Gross, ContactID: p.ContactID}}
+		entry.Lines = []ledger.Line{{Account: "320", Credit: res.Gross, ContactID: p.ContactID}}
+		if stockNet > 0 {
+			entry.Lines = append(entry.Lines, ledger.Line{Account: "153", Debit: stockNet})
+		}
+		if otherNet > 0 {
+			entry.Lines = append(entry.Lines, ledger.Line{Account: "770", Debit: otherNet})
+		}
 		if res.VAT > 0 {
 			entry.Lines = append(entry.Lines, ledger.Line{Account: "191", Debit: res.VAT})
 		}
@@ -175,21 +296,47 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Invoice, error) 
 	return inv, nil
 }
 
-// CancelTx faturayı iptal eder: fatura silinmez, yevmiye kaydı ters kayıtla kapatılır.
+// CancelTx faturayı iptal eder: fatura silinmez, yevmiye kaydı ters kayıtla kapatılır, stok
+// hareketleri pasifleştirilir. Mahsup edilmiş fatura iptal edilemez (önce tahsilat silinmeli).
 // date ters kaydın tarihidir; kapatılmış bir döneme denk gelirse ledger.ErrPeriodClosed döner.
-func CancelTx(ctx context.Context, tx pgx.Tx, businessID, userID, invoiceID string, date time.Time) error {
-	var status string
-	err := tx.QueryRow(ctx,
-		`SELECT status FROM invoices WHERE id = $1::uuid AND business_id = $2::uuid FOR UPDATE`, invoiceID, businessID).Scan(&status)
+func CancelTx(ctx context.Context, tx pgx.Tx, businessID, userID, invoiceID string, date time.Time, touched stock.Set) error {
+	var contactID string
+	err := tx.QueryRow(ctx, `SELECT contact_id::text FROM invoices WHERE id = $1::uuid AND business_id = $2::uuid`,
+		invoiceID, businessID).Scan(&contactID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
+	// Kilit sırası: cari -> fatura -> ürünler. Tahsilat mahsubu da aynı sırayı izler.
+	if err := LockContact(ctx, tx, businessID, contactID); err != nil {
+		return err
+	}
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM invoices WHERE id = $1::uuid FOR UPDATE`, invoiceID).Scan(&status); err != nil {
+		return err
+	}
 	if status == "cancelled" {
 		return ErrAlreadyCancelled
 	}
+	var paid bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM payment_allocations WHERE invoice_id = $1::uuid AND reversed_at IS NULL)`, invoiceID).Scan(&paid); err != nil {
+		return err
+	}
+	if paid {
+		return ErrHasPayments
+	}
+
+	pids, err := stock.ProductsOfInvoice(ctx, tx, businessID, invoiceID)
+	if err != nil {
+		return err
+	}
+	if _, err := stock.LockProducts(ctx, tx, businessID, pids); err != nil {
+		return err
+	}
+
 	var entryID string
 	if err := tx.QueryRow(ctx,
 		`SELECT id::text FROM journal_entries
@@ -200,22 +347,34 @@ func CancelTx(ctx context.Context, tx pgx.Tx, businessID, userID, invoiceID stri
 	if _, err := ledger.Reverse(ctx, tx, businessID, entryID, date, userID); err != nil {
 		return err
 	}
+	if err := stock.DeactivateInvoice(ctx, tx, businessID, invoiceID); err != nil {
+		return err
+	}
+	for _, id := range pids {
+		touched.Add(id)
+	}
 	_, err = tx.Exec(ctx, `UPDATE invoices SET status = 'cancelled', cancelled_at = now() WHERE id = $1::uuid`, invoiceID)
 	return err
 }
 
 const invoiceCols = `id::text, kind, series, year, number, contact_id::text, issue_date, due_date, status,
-	prices_include_vat, general_discount, net_total, vat_total, gross_total`
+	prices_include_vat, general_discount, net_total, vat_total, gross_total,
+	coalesce((SELECT sum(a.amount) FROM payment_allocations a WHERE a.invoice_id = invoices.id AND a.reversed_at IS NULL), 0)::bigint`
 
-func scanInvoice(row pgx.Row) (*Invoice, error) {
+type scanner interface{ Scan(dest ...any) error }
+
+func scanInvoice(row scanner) (*Invoice, error) {
 	var i Invoice
 	var issue, due time.Time
 	if err := row.Scan(&i.ID, &i.Kind, &i.Series, &i.Year, &i.Seq, &i.ContactID, &issue, &due, &i.Status,
-		&i.PricesIncludeVAT, &i.GeneralDiscount, &i.NetTotal, &i.VATTotal, &i.GrossTotal); err != nil {
+		&i.PricesIncludeVAT, &i.GeneralDiscount, &i.NetTotal, &i.VATTotal, &i.GrossTotal, &i.Paid); err != nil {
 		return nil, err
 	}
 	i.Number = FormatNumber(i.Series, i.Year, i.Seq)
 	i.IssueDate, i.DueDate = issue.Format(dateLayout), due.Format(dateLayout)
+	if i.Status == "issued" {
+		i.Open = i.GrossTotal - i.Paid
+	}
 	return &i, nil
 }
 
@@ -230,8 +389,8 @@ func Get(ctx context.Context, q ledger.Querier, businessID, id string) (*Invoice
 		return nil, err
 	}
 	rows, err := q.Query(ctx,
-		`SELECT line_no, description, quantity_milli, unit_price, vat_rate, line_discount, allocated_discount,
-		        net_amount, vat_amount, gross_amount
+		`SELECT line_no, coalesce(product_id::text,''), description, quantity_milli, unit_price, vat_rate, line_discount,
+		        allocated_discount, net_amount, vat_amount, gross_amount
 		   FROM invoice_lines WHERE invoice_id = $1::uuid ORDER BY line_no`, id)
 	if err != nil {
 		return nil, err
@@ -239,7 +398,7 @@ func Get(ctx context.Context, q ledger.Querier, businessID, id string) (*Invoice
 	defer rows.Close()
 	for rows.Next() {
 		var l InvoiceLine
-		if err := rows.Scan(&l.LineNo, &l.Description, &l.QuantityMilli, &l.UnitPrice, &l.VATRate, &l.Discount,
+		if err := rows.Scan(&l.LineNo, &l.ProductID, &l.Description, &l.QuantityMilli, &l.UnitPrice, &l.VATRate, &l.Discount,
 			&l.AllocatedDiscount, &l.Net, &l.VAT, &l.Gross); err != nil {
 			return nil, err
 		}
@@ -260,15 +419,13 @@ func List(ctx context.Context, q ledger.Querier, businessID, after string, limit
 	defer rows.Close()
 	out := []Invoice{}
 	for rows.Next() {
-		var i Invoice
-		var issue, due time.Time
-		if err := rows.Scan(&i.ID, &i.Kind, &i.Series, &i.Year, &i.Seq, &i.ContactID, &issue, &due, &i.Status,
-			&i.PricesIncludeVAT, &i.GeneralDiscount, &i.NetTotal, &i.VATTotal, &i.GrossTotal); err != nil {
+		i, err := scanInvoice(rows)
+		if err != nil {
 			return nil, err
 		}
-		i.Number = FormatNumber(i.Series, i.Year, i.Seq)
-		i.IssueDate, i.DueDate = issue.Format(dateLayout), due.Format(dateLayout)
-		out = append(out, i)
+		out = append(out, *i)
 	}
 	return out, rows.Err()
 }
+
+var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
