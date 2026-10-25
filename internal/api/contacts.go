@@ -96,23 +96,35 @@ func parsePage(w http.ResponseWriter, r *http.Request) (limit int, after string,
 		limit = n
 	}
 	after = r.URL.Query().Get("after")
-	if after != "" && !isUUID(after) {
-		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "after geçersiz")
-		return 0, "", false
-	}
 	return limit, after, true
 }
 
+// handleListContacts carileri ada göre sıralı, keyset sayfalamayla listeler.
+// Süzgeçler: q (ad içinde arama), kind (customer: müşteri+ikisi, supplier: tedarikçi+ikisi).
 func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	c, _ := httpx.ClaimsFrom(r.Context())
 	limit, after, ok := parsePage(w, r)
 	if !ok {
 		return
 	}
+	afterName, afterID, ok := parseCursor(w, after)
+	if !ok {
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	if !oneOf(kind, "customer", "supplier", "both") {
+		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "kind geçersiz")
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	rows, err := s.pool.Query(r.Context(),
 		`SELECT id::text, kind, name, coalesce(tax_no,''), coalesce(email,''), coalesce(phone,'')
-		   FROM contacts WHERE business_id = $1::uuid AND ($2 = '' OR id > $2::uuid)
-		  ORDER BY id LIMIT $3`, c.BusinessID, after, limit+1)
+		   FROM contacts
+		  WHERE business_id = $1::uuid
+		    AND ($2 = '' OR (name, id) > ($2, NULLIF($3,'')::uuid))
+		    AND ($4 = '' OR position(lower($4) in lower(name)) > 0)
+		    AND ($5 = '' OR kind = $5 OR (kind = 'both' AND $5 IN ('customer','supplier')))
+		  ORDER BY contacts.name, contacts.id LIMIT $6`, c.BusinessID, afterName, afterID, q, kind, limit+1)
 	if err != nil {
 		s.internalError(w, "cari listesi", err)
 		return
@@ -134,7 +146,8 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	var next any
 	if len(items) > limit {
 		items = items[:limit]
-		next = items[len(items)-1].ID
+		last := items[len(items)-1]
+		next = encodeCursor(last.Name, last.ID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_after": next})
 }

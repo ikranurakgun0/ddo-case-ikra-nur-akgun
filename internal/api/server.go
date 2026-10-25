@@ -58,6 +58,8 @@ func (s *Server) Routes() http.Handler {
 		staff := httpx.RequireRole(auth.RoleOwner, auth.RoleAccountant, auth.RoleEmployee)
 		books := httpx.RequireRole(auth.RoleOwner, auth.RoleAccountant)
 
+		r.With(staff).Get("/dashboard", s.handleDashboard)
+
 		r.With(staff).Post("/contacts", s.handleCreateContact)
 		r.With(staff).Get("/contacts", s.handleListContacts)
 		r.With(staff).Get("/contacts/{id}", s.handleGetContact)

@@ -58,6 +58,7 @@ type Invoice struct {
 	Year             int           `json:"year"`
 	Seq              int64         `json:"seq"`
 	ContactID        string        `json:"contact_id"`
+	ContactName      string        `json:"contact_name"`
 	IssueDate        string        `json:"issue_date"`
 	DueDate          string        `json:"due_date"`
 	Status           string        `json:"status"`
@@ -66,6 +67,7 @@ type Invoice struct {
 	NetTotal         int64         `json:"net_total"`
 	VATTotal         int64         `json:"vat_total"`
 	GrossTotal       int64         `json:"gross_total"`
+	CreatedAt        time.Time     `json:"created_at"`
 	Paid             int64         `json:"paid"` // mahsup edilen tutar
 	Open             int64         `json:"open"` // kalan tutar (iptal edilmişse 0)
 	Lines            []InvoiceLine `json:"lines,omitempty"`
@@ -231,9 +233,9 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams, touched stock.Set)
 	err = tx.QueryRow(ctx,
 		`INSERT INTO invoices(business_id, kind, contact_id, series, year, number, issue_date, due_date,
 		                      prices_include_vat, general_discount, net_total, vat_total, gross_total, created_by)
-		 VALUES ($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,'')::uuid) RETURNING id::text`,
+		 VALUES ($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,'')::uuid) RETURNING id::text, created_at`,
 		p.BusinessID, p.Kind, p.ContactID, p.Series, year, seq, p.IssueDate, p.DueDate,
-		p.IncludesVAT, p.GeneralDiscount, res.Net, res.VAT, res.Gross, p.UserID).Scan(&inv.ID)
+		p.IncludesVAT, p.GeneralDiscount, res.Net, res.VAT, res.Gross, p.UserID).Scan(&inv.ID, &inv.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +360,8 @@ func CancelTx(ctx context.Context, tx pgx.Tx, businessID, userID, invoiceID stri
 }
 
 const invoiceCols = `id::text, kind, series, year, number, contact_id::text, issue_date, due_date, status,
-	prices_include_vat, general_discount, net_total, vat_total, gross_total,
+	prices_include_vat, general_discount, net_total, vat_total, gross_total, created_at,
+	coalesce((SELECT c.name FROM contacts c WHERE c.id = invoices.contact_id), ''),
 	coalesce((SELECT sum(a.amount) FROM payment_allocations a WHERE a.invoice_id = invoices.id AND a.reversed_at IS NULL), 0)::bigint`
 
 type scanner interface{ Scan(dest ...any) error }
@@ -367,7 +370,7 @@ func scanInvoice(row scanner) (*Invoice, error) {
 	var i Invoice
 	var issue, due time.Time
 	if err := row.Scan(&i.ID, &i.Kind, &i.Series, &i.Year, &i.Seq, &i.ContactID, &issue, &due, &i.Status,
-		&i.PricesIncludeVAT, &i.GeneralDiscount, &i.NetTotal, &i.VATTotal, &i.GrossTotal, &i.Paid); err != nil {
+		&i.PricesIncludeVAT, &i.GeneralDiscount, &i.NetTotal, &i.VATTotal, &i.GrossTotal, &i.CreatedAt, &i.ContactName, &i.Paid); err != nil {
 		return nil, err
 	}
 	i.Number = FormatNumber(i.Series, i.Year, i.Seq)
@@ -407,13 +410,22 @@ func Get(ctx context.Context, q ledger.Querier, businessID, id string) (*Invoice
 	return inv, rows.Err()
 }
 
-// List keyset sayfalama kullanır (id'ye göre artan; after = önceki sayfanın son id'si).
-// series boş değilse yalnızca o seriye ait faturalar listelenir.
-func List(ctx context.Context, q ledger.Querier, businessID, after, series string, limit int) ([]Invoice, error) {
+// ListFilter fatura listesi süzgeçleridir; boş alanlar uygulanmaz.
+type ListFilter struct{ Series, Kind, Status, ContactID string }
+
+// List faturaları yeniden eskiye (oluşturulma zamanı, id) doğru, keyset sayfalamayla listeler.
+// afterTS/afterID önceki sayfanın son kaydının oluşturulma zamanı (RFC3339) ve id'sidir.
+func List(ctx context.Context, q ledger.Querier, businessID string, f ListFilter, afterTS, afterID string, limit int) ([]Invoice, error) {
+	// ORDER BY'da sütunlar tablo adıyla nitelenir: niteleyici olmazsa `id`, SELECT'teki id::text çıktı sütununa bağlanır
+	// ve sıralama keyset koşuluyla (uuid) tutarsız kalır.
 	rows, err := q.Query(ctx,
 		`SELECT `+invoiceCols+` FROM invoices
-		  WHERE business_id = $1::uuid AND ($2 = '' OR id > $2::uuid) AND ($4 = '' OR series = $4)
-		  ORDER BY id LIMIT $3`, businessID, after, limit, series)
+		  WHERE business_id = $1::uuid
+		    AND (NULLIF($2,'') IS NULL OR (created_at, id) < (NULLIF($2,'')::timestamptz, NULLIF($3,'')::uuid))
+		    AND ($4 = '' OR series = $4) AND ($5 = '' OR kind = $5) AND ($6 = '' OR status = $6)
+		    AND (NULLIF($7,'') IS NULL OR contact_id = NULLIF($7,'')::uuid)
+		  ORDER BY invoices.created_at DESC, invoices.id DESC LIMIT $8`,
+		businessID, afterTS, afterID, f.Series, f.Kind, f.Status, f.ContactID, limit)
 	if err != nil {
 		return nil, err
 	}

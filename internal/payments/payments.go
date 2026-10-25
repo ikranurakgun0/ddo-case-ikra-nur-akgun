@@ -36,10 +36,12 @@ type Payment struct {
 	ID          string       `json:"id"`
 	Kind        string       `json:"kind"` // receipt | disbursement
 	ContactID   string       `json:"contact_id"`
+	ContactName string       `json:"contact_name"`
 	Method      string       `json:"method"` // cash | bank
 	Date        string       `json:"date"`
 	Amount      int64        `json:"amount"`
 	Status      string       `json:"status"`
+	CreatedAt   time.Time    `json:"created_at"`
 	Allocated   int64        `json:"allocated"`
 	Advance     int64        `json:"advance"` // mahsup edilmeyen (avans) kısım
 	Allocations []Allocation `json:"allocations,omitempty"`
@@ -174,8 +176,8 @@ func CreateTx(ctx context.Context, tx pgx.Tx, p CreateParams) (*Payment, error) 
 		Amount: p.Amount, Status: "active"}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO payments(business_id, kind, contact_id, method, pay_date, amount, created_by)
-		 VALUES ($1::uuid,$2,$3::uuid,$4,$5,$6,NULLIF($7,'')::uuid) RETURNING id::text`,
-		p.BusinessID, p.Kind, p.ContactID, p.Method, p.Date, p.Amount, p.UserID).Scan(&pay.ID)
+		 VALUES ($1::uuid,$2,$3::uuid,$4,$5,$6,NULLIF($7,'')::uuid) RETURNING id::text, created_at`,
+		p.BusinessID, p.Kind, p.ContactID, p.Method, p.Date, p.Amount, p.UserID).Scan(&pay.ID, &pay.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +324,8 @@ func DeleteTx(ctx context.Context, tx pgx.Tx, businessID, userID, paymentID stri
 	return err
 }
 
-const paymentCols = `p.id::text, p.kind, p.contact_id::text, p.method, p.pay_date, p.amount, p.status,
+const paymentCols = `p.id::text, p.kind, p.contact_id::text, p.method, p.pay_date, p.amount, p.status, p.created_at,
+	coalesce((SELECT c.name FROM contacts c WHERE c.id = p.contact_id), ''),
 	CASE WHEN p.status = 'active' THEN coalesce((SELECT sum(a.amount) FROM payment_allocations a
 	                                              WHERE a.payment_id = p.id AND a.reversed_at IS NULL),0) ELSE 0 END::bigint`
 
@@ -331,7 +334,7 @@ type scanner interface{ Scan(dest ...any) error }
 func scanPayment(r scanner) (*Payment, error) {
 	var p Payment
 	var d time.Time
-	if err := r.Scan(&p.ID, &p.Kind, &p.ContactID, &p.Method, &d, &p.Amount, &p.Status, &p.Allocated); err != nil {
+	if err := r.Scan(&p.ID, &p.Kind, &p.ContactID, &p.Method, &d, &p.Amount, &p.Status, &p.CreatedAt, &p.ContactName, &p.Allocated); err != nil {
 		return nil, err
 	}
 	p.Date = d.Format(dateLayout)
@@ -372,11 +375,17 @@ func Get(ctx context.Context, q ledger.Querier, businessID, id string) (*Payment
 	return p, rows.Err()
 }
 
-// List keyset sayfalama (id'ye göre artan).
-func List(ctx context.Context, q ledger.Querier, businessID, after string, limit int) ([]Payment, error) {
+// ListFilter ödeme listesi süzgeçleridir; boş alanlar uygulanmaz.
+type ListFilter struct{ Kind, ContactID string }
+
+// List ödemeleri yeniden eskiye (oluşturulma zamanı, id) doğru, keyset sayfalamayla listeler.
+func List(ctx context.Context, q ledger.Querier, businessID string, f ListFilter, afterTS, afterID string, limit int) ([]Payment, error) {
 	rows, err := q.Query(ctx,
 		`SELECT `+paymentCols+` FROM payments p
-		  WHERE p.business_id = $1::uuid AND ($2 = '' OR p.id > $2::uuid) ORDER BY p.id LIMIT $3`, businessID, after, limit)
+		  WHERE p.business_id = $1::uuid
+		    AND (NULLIF($2,'') IS NULL OR (p.created_at, p.id) < (NULLIF($2,'')::timestamptz, NULLIF($3,'')::uuid))
+		    AND ($4 = '' OR p.kind = $4) AND (NULLIF($5,'') IS NULL OR p.contact_id = NULLIF($5,'')::uuid)
+		  ORDER BY p.created_at DESC, p.id DESC LIMIT $6`, businessID, afterTS, afterID, f.Kind, f.ContactID, limit)
 	if err != nil {
 		return nil, err
 	}

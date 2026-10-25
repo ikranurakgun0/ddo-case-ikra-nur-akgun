@@ -179,7 +179,13 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	c, _ := httpx.ClaimsFrom(r.Context())
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"user_id": c.UserID, "business_id": c.BusinessID, "role": c.Role,
-	})
+	out := map[string]any{"user_id": c.UserID, "business_id": c.BusinessID, "role": c.Role}
+	var email, bizName string
+	var contactID *string
+	if err := s.pool.QueryRow(r.Context(),
+		`SELECT u.email, b.name, u.contact_id::text FROM users u JOIN businesses b ON b.id = u.business_id WHERE u.id = $1::uuid`,
+		c.UserID).Scan(&email, &bizName, &contactID); err == nil {
+		out["email"], out["business_name"], out["contact_id"] = email, bizName, contactID
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }

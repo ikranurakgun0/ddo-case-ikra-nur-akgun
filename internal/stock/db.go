@@ -248,13 +248,21 @@ type MovementRow struct {
 	InvoiceID     string `json:"invoice_id"`
 }
 
-// Movements keyset sayfalama (id'ye göre artan).
-func Movements(ctx context.Context, q ledger.Querier, businessID, productID string, after int64, limit int) ([]MovementRow, error) {
+// Movements keyset sayfalama (id'ye göre). desc=true ise en yeni hareket önce gelir ve after, son görülen id'dir
+// (after=0 "baştan" demektir).
+func Movements(ctx context.Context, q ledger.Querier, businessID, productID string, after int64, limit int, desc bool) ([]MovementRow, error) {
+	order, cmp := "ASC", ">"
+	if desc {
+		order, cmp = "DESC", "<"
+		if after == 0 {
+			after = 1 << 62
+		}
+	}
 	rows, err := q.Query(ctx,
 		`SELECT id, product_id::text, direction, movement_date, quantity_milli, value, active, invoice_id::text
 		   FROM stock_movements
-		  WHERE business_id = $1::uuid AND ($2 = '' OR product_id = $2::uuid) AND id > $3
-		  ORDER BY id LIMIT $4`, businessID, productID, after, limit)
+		  WHERE business_id = $1::uuid AND ($2 = '' OR product_id = $2::uuid) AND id `+cmp+` $3
+		  ORDER BY id `+order+` LIMIT $4`, businessID, productID, after, limit)
 	if err != nil {
 		return nil, err
 	}

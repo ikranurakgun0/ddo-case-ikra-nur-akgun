@@ -64,13 +64,23 @@ func (s *Server) handleGetPayment(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, p)
 }
 
+// handleListPayments ödemeleri yeniden eskiye listeler. Süzgeçler: kind, contact_id.
 func (s *Server) handleListPayments(w http.ResponseWriter, r *http.Request) {
 	c, _ := httpx.ClaimsFrom(r.Context())
 	limit, after, ok := parsePage(w, r)
 	if !ok {
 		return
 	}
-	items, err := payments.List(r.Context(), s.pool, c.BusinessID, after, limit+1)
+	afterTS, afterID, ok := parseCursor(w, after)
+	if !ok {
+		return
+	}
+	f := payments.ListFilter{Kind: r.URL.Query().Get("kind"), ContactID: r.URL.Query().Get("contact_id")}
+	if !oneOf(f.Kind, "receipt", "disbursement") || (f.ContactID != "" && !isUUID(f.ContactID)) {
+		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "süzgeç değeri geçersiz")
+		return
+	}
+	items, err := payments.List(r.Context(), s.pool, c.BusinessID, f, afterTS, afterID, limit+1)
 	if err != nil {
 		s.internalError(w, "ödeme listesi", err)
 		return
@@ -78,7 +88,8 @@ func (s *Server) handleListPayments(w http.ResponseWriter, r *http.Request) {
 	var next any
 	if len(items) > limit {
 		items = items[:limit]
-		next = items[len(items)-1].ID
+		last := items[len(items)-1]
+		next = timeCursor(last.CreatedAt, last.ID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_after": next})
 }

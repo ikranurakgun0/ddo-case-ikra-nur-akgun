@@ -175,13 +175,24 @@ func (s *Server) handleGetInvoice(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, inv)
 }
 
+// handleListInvoices faturaları yeniden eskiye listeler. Süzgeçler: series, kind, status, contact_id.
 func (s *Server) handleListInvoices(w http.ResponseWriter, r *http.Request) {
 	c, _ := httpx.ClaimsFrom(r.Context())
 	limit, after, ok := parsePage(w, r)
 	if !ok {
 		return
 	}
-	items, err := invoicing.List(r.Context(), s.pool, c.BusinessID, after, r.URL.Query().Get("series"), limit+1)
+	afterTS, afterID, ok := parseCursor(w, after)
+	if !ok {
+		return
+	}
+	qp := r.URL.Query()
+	f := invoicing.ListFilter{Series: qp.Get("series"), Kind: qp.Get("kind"), Status: qp.Get("status"), ContactID: qp.Get("contact_id")}
+	if !oneOf(f.Kind, "sale", "purchase") || !oneOf(f.Status, "issued", "cancelled") || (f.ContactID != "" && !isUUID(f.ContactID)) {
+		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "süzgeç değeri geçersiz")
+		return
+	}
+	items, err := invoicing.List(r.Context(), s.pool, c.BusinessID, f, afterTS, afterID, limit+1)
 	if err != nil {
 		s.internalError(w, "fatura listesi", err)
 		return
@@ -189,7 +200,8 @@ func (s *Server) handleListInvoices(w http.ResponseWriter, r *http.Request) {
 	var next any
 	if len(items) > limit {
 		items = items[:limit]
-		next = items[len(items)-1].ID
+		last := items[len(items)-1]
+		next = timeCursor(last.CreatedAt, last.ID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_after": next})
 }

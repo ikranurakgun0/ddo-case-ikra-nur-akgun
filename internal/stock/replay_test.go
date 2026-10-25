@@ -1,6 +1,7 @@
 package stock
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
 )
@@ -126,5 +127,28 @@ func TestConservationRandomized(t *testing.T) {
 				t.Fatalf("iter %d: deterministik değil", iter)
 			}
 		}
+	}
+}
+
+// BenchmarkReplay bir ürünün hareket sayısına göre oynatma maliyetini ölçer (README: bilinen sınırlamalar).
+func BenchmarkReplay(b *testing.B) {
+	for _, n := range []int{200, 2_000, 20_000, 200_000} {
+		moves := make([]Move, 0, n)
+		var id, q int64
+		for i := 0; i < n; i++ {
+			id++
+			if i%3 != 2 {
+				moves = append(moves, Move{ID: id, Qty: 10_000, InValue: 100_000 + int64(i%7)*333, Active: true})
+				q += 10_000
+			} else {
+				moves = append(moves, Move{ID: id, Out: true, Qty: 4_000 + int64(i%5)*100, Active: true})
+				q -= 4_000
+			}
+		}
+		b.Run(fmt.Sprintf("hareket=%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				Replay(moves)
+			}
+		})
 	}
 }

@@ -170,6 +170,14 @@ func (b *biz) setup(ctx context.Context) error {
 			b.services = append(b.services, p)
 		}
 	}
+	// Açılış sermayesi: işletme kasasız başlamasın (banka 1.000.000 ₺, sermaye hesabına karşılık).
+	if err := b.tx(ctx, func(tx pgx.Tx) error {
+		_, err := ledger.Post(ctx, tx, ledger.Entry{BusinessID: b.id, Date: b.cfg.Start, Description: "Açılış sermayesi",
+			SourceType: "manual", Lines: []ledger.Line{{Account: "102", Debit: 100_000_000}, {Account: "500", Credit: 100_000_000}}})
+		return err
+	}); err != nil {
+		return err
+	}
 	for i, role := range Roles {
 		var contact any
 		if role == auth.RoleCustomer {
@@ -207,15 +215,15 @@ func (b *biz) run(ctx context.Context) error {
 			err = b.sale(ctx, date)
 		case r < 530:
 			err = b.purchase(ctx, date, nil, 0)
-		case r < 800:
+		case r < 770:
 			err = b.receipt(ctx, date)
-		case r < 850:
+		case r < 880:
 			err = b.disbursement(ctx, date)
-		case r < 890:
-			err = b.cancelSale(ctx, date)
 		case r < 910:
+			err = b.cancelSale(ctx, date)
+		case r < 925:
 			err = b.deletePayment(ctx, date)
-		case r < 930:
+		case r < 940:
 			err = b.correctPurchase(ctx, date)
 		default:
 			err = b.purchase(ctx, date, nil, 5+b.rng.Intn(36)) // geçmişe dönük alış
@@ -327,7 +335,7 @@ func (b *biz) purchase(ctx context.Context, date time.Time, forced *simProduct, 
 	add := func(p *simProduct) {
 		var qty int64
 		if p.goods {
-			qty = int64(20+b.rng.Intn(280)) * 1000
+			qty = int64(10+b.rng.Intn(40)) * 1000
 		} else {
 			qty = 1000
 		}
@@ -337,7 +345,7 @@ func (b *biz) purchase(ctx context.Context, date time.Time, forced *simProduct, 
 	}
 	if forced != nil {
 		add(forced)
-		lines[0].QuantityMilli += 200_000 // hedef ürün için tampon
+		lines[0].QuantityMilli += 20_000 // hedef ürün için tampon (20 birim)
 		refs[0].qty = lines[0].QuantityMilli
 	} else {
 		for i, n := 0, 1+b.rng.Intn(3); i < n; i++ {

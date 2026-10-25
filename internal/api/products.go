@@ -120,15 +120,30 @@ func (s *Server) handleGetProduct(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, p)
 }
 
+// handleListProducts ürünleri SKU'ya göre sıralı listeler. Süzgeçler: q (SKU/ad), kind (product|service).
 func (s *Server) handleListProducts(w http.ResponseWriter, r *http.Request) {
 	c, _ := httpx.ClaimsFrom(r.Context())
 	limit, after, ok := parsePage(w, r)
 	if !ok {
 		return
 	}
+	afterSKU, afterID, ok := parseCursor(w, after)
+	if !ok {
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	if !oneOf(kind, "product", "service") {
+		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "kind geçersiz")
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	rows, err := s.pool.Query(r.Context(),
 		`SELECT id::text, sku, name, kind, unit, vat_rate, sale_price FROM products
-		  WHERE business_id = $1::uuid AND ($2 = '' OR id > $2::uuid) ORDER BY id LIMIT $3`, c.BusinessID, after, limit+1)
+		  WHERE business_id = $1::uuid
+		    AND ($2 = '' OR (sku, id) > ($2, NULLIF($3,'')::uuid))
+		    AND ($4 = '' OR position(lower($4) in lower(sku)) > 0 OR position(lower($4) in lower(name)) > 0)
+		    AND ($5 = '' OR kind = $5)
+		  ORDER BY products.sku, products.id LIMIT $6`, c.BusinessID, afterSKU, afterID, q, kind, limit+1)
 	if err != nil {
 		s.internalError(w, "ürün listesi", err)
 		return
@@ -143,10 +158,15 @@ func (s *Server) handleListProducts(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, p)
 	}
+	if err := rows.Err(); err != nil {
+		s.internalError(w, "ürün listesi", err)
+		return
+	}
 	var next any
 	if len(items) > limit {
 		items = items[:limit]
-		next = items[len(items)-1].ID
+		last := items[len(items)-1]
+		next = encodeCursor(last.SKU, last.ID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_after": next})
 }
@@ -186,7 +206,7 @@ func (s *Server) handleStockMovements(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "validation_error", "product_id geçersiz")
 		return
 	}
-	items, err := stock.Movements(r.Context(), s.pool, c.BusinessID, pid, after, limit+1)
+	items, err := stock.Movements(r.Context(), s.pool, c.BusinessID, pid, after, limit+1, r.URL.Query().Get("order") == "desc")
 	if err != nil {
 		s.internalError(w, "stok hareketleri", err)
 		return
